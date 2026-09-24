@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Added PATH export for $(go env GOPATH)/bin so kubectl-ate plugin is immediately discoverable.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -28,6 +29,7 @@ export NO_DEV_ENV
 export GOCACHE=/tmp/gocache
 export GOTMPDIR=/tmp/gotmp
 mkdir -p "${GOCACHE}" "${GOTMPDIR}"
+export PATH="$(go env GOPATH)/bin:${PATH}"
 
 # 1. APIs, cluster, bucket, IAM (setup-gcp)
 go run ./tools/setup-gcp enable apis

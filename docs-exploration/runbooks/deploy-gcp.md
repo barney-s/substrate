@@ -71,6 +71,7 @@ No ✗ items: every step's permission was granted when this was drafted.
 # 0. Parameters and derived names.
 source params.env   # PROJECT_ID GCE_REGION CLUSTER_LOCATION RESOURCE_PREFIX
 export NO_DEV_ENV=1 GOCACHE=/tmp/gocache GOTMPDIR=/tmp/gotmp
+export PATH="$(go env GOPATH)/bin:${PATH}"
 mkdir -p "$GOCACHE" "$GOTMPDIR"
 export PROJECT_NUMBER=$(gcloud projects describe "${PROJECT_ID}" --format="value(projectNumber)")
 export CLUSTER_NAME="${RESOURCE_PREFIX}"
@@ -127,10 +128,11 @@ kubectl ate get actor rb-counter-1 -a ate-demo-counter        # RUNNING, with a 
 kubectl ate suspend actor rb-counter-1 -a ate-demo-counter
 gcloud storage ls "gs://${BUCKET_NAME}/" | head                # a snapshot landed
 curl -X POST -H "ate-target-actor: ate-demo-counter/rb-counter-1" http://localhost:8000  # counts continue
+kubectl ate suspend actor rb-counter-1 -a ate-demo-counter   # suspend before deleting
 kubectl ate delete actor rb-counter-1 -a ate-demo-counter
 kill %1
 
-# Optional: the CI demo lifecycle test against this cluster.
+# Optional: the CI demo lifecycle test against this cluster (requires exported params.env).
 hack/run-e2e.sh ./internal/e2e/suites/demo -run '^TestActorLifecycle$' -v -args --no-color
 ```
 
