@@ -19,6 +19,7 @@ import (
 	"fmt"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 
 	"github.com/agent-substrate/substrate/cmd/ate-setup/internal/log"
 )
@@ -40,6 +41,11 @@ func (e *Env) DeleteAteSystem(ctx context.Context) error {
 		if err := e.Kube.DeleteBytes(ctx, manifest); err != nil {
 			return err
 		}
+		// Not part of the kind bundle (see its kustomization), so it goes by
+		// name. The directory delete below covers it on every other install.
+		if err := e.Kube.DeletePath(ctx, e.Cfg.Manifest("pod-certificate-controller.yaml")); err != nil {
+			return err
+		}
 	} else if err := e.Kube.DeletePath(ctx, e.Cfg.Manifest()); err != nil {
 		return err
 	}
@@ -58,6 +64,9 @@ func (e *Env) DeleteAteSystem(ctx context.Context) error {
 		if err := e.Kube.DeletePath(ctx, e.Cfg.Manifest(path...)); err != nil {
 			return err
 		}
+	}
+	if err := e.Kube.WaitDeleted(ctx, schema.GroupVersionKind{Version: "v1", Kind: "Namespace"}, "", e.Namespace(), e.Cfg.WaitTimeout(BootstrapTimeout)); err != nil {
+		return err
 	}
 	return e.UnlabelNodesSubstrateVersion(ctx)
 }

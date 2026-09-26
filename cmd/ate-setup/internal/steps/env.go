@@ -22,6 +22,10 @@ import (
 	"fmt"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+
 	"github.com/agent-substrate/substrate/cmd/ate-setup/internal/config"
 	"github.com/agent-substrate/substrate/cmd/ate-setup/internal/images"
 	"github.com/agent-substrate/substrate/cmd/ate-setup/internal/ko"
@@ -38,6 +42,11 @@ const (
 	// CSI drivers. Pass it through Config.WaitTimeout, which lets the flag
 	// raise it without its shorter default lowering it.
 	BootstrapTimeout = 120 * time.Second
+	// TrustBundleTimeout bounds the wait for the podcertificate controller's
+	// first ClusterTrustBundles, shared across both bundles. The controller is
+	// Ready before it has signed anything, so this covers its first pass over
+	// the CA pools rather than a rollout. Config.WaitTimeout applies here too.
+	TrustBundleTimeout = 300 * time.Second
 	// DemoTimeout is longer because a cold cluster pays one-time costs on the
 	// first ActorTemplate: downloading runsc, the first gVisor pod start, and
 	// image pulls.
@@ -213,6 +222,11 @@ func (e *Env) KustomizeResolve(ctx context.Context, overlay string) ([]byte, err
 // is created plainly, because that manifest names ate-system literally.
 func (e *Env) EnsureAteSystemNamespace(ctx context.Context) error {
 	ns := e.Namespace()
+	if existing, err := e.Kube.Typed.CoreV1().Namespaces().Get(ctx, ns, metav1.GetOptions{}); err == nil && existing.Status.Phase == corev1.NamespaceTerminating {
+		if err := e.Kube.WaitDeleted(ctx, schema.GroupVersionKind{Version: "v1", Kind: "Namespace"}, "", ns, e.Cfg.WaitTimeout(BootstrapTimeout)); err != nil {
+			return err
+		}
+	}
 	if ns == NamespaceAteSystem {
 		if err := e.Kube.ApplyPath(ctx, e.Cfg.Manifest("ate-system-namespace.yaml")); err != nil {
 			return err
