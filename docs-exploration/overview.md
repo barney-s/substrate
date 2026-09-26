@@ -1,6 +1,6 @@
 # Overview
 
-*Derived from code at `985c2002` (2026-09-23).*
+*Derived from code at `c7b54699` (2026-09-26).*
 
 ## What it is
 
@@ -48,20 +48,19 @@ named in the README are google/ax (Agent Executor) and kagent.
 5. Later, `SuspendActor` (full snapshot to object storage) or `PauseActor`
    (snapshot kept on the node's disk) frees the worker.
 
-## Maturity (as of 2026-09-23)
+## Maturity (as of 2026-09-26)
 
 - Early. The README says APIs will change and nothing is production-ready.
   `docs/architecture.md` opens with "much of this architecture is
   aspirational".
 - **What works end to end:** CI runs the counter demo on both gVisor and
-  micro-VM on kind with KVM, plus the egress, networking, parking and identity
-  e2e suites.
+  micro-VM on kind with KVM, plus the egress, networking, parking, identity, and
+  multiactor e2e suites.
 - **Not yet enforced:**
   - Authorization: an OpenFGA server is started but never consulted.
-  - A worker hosts exactly one actor: `internal/ateomcapacity` hard-codes 1,
-    even though the scheduler is written for more.
-- **Churn is concentrated in** `cmd/ateapi`, `cmd/ate-setup`, `internal/e2e`
-  and `cmd/atenet`.
+- **Multi-Actor Workers:**
+  - Support for multi-actor workers is now fully implemented. Workers can host multiple sandboxed actors concurrently (up to `--max-actors`, defaulting to 1000) using isolated network namespaces and per-actor cgroups.
+- **Churn is concentrated in** `cmd/ateapi`, `cmd/ate-setup`, `cmd/ateom-gvisor`, `cmd/ateom-microvm`, and `cmd/atelet`.
 
 ## Vocabulary you need
 

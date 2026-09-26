@@ -1,6 +1,6 @@
 # Code map
 
-*Derived from code at `985c2002` (2026-09-23). The repo has about 127k lines of non-test Go outside `vendor/`.*
+*Derived from code at `c7b54699` (2026-09-26). The repo has about 127k lines of non-test Go outside `vendor/`.*
 
 ## Top level
 
@@ -22,8 +22,8 @@
 |---|---|
 | `ateapi` | `main.go` wiring → `internal/controlapi` (the API and workflows), `internal/store/atepg`, `internal/scheduling`, `internal/workercache`, `internal/workerservice` |
 | `atelet` | A large `main.go` (~2k lines, holds the AteomHerder RPCs), `oci.go`, `sandbox_assets.go`, `local_checkpoints.go`, `internal/ategcs` (GCS/S3 + sparse zstd) |
-| `ateom-gvisor` | `main.go` (Run/Checkpoint/Restore), `runsc.go`, `sandboxnet.go` |
-| `ateom-microvm` | `run.go`, `checkpoint.go`, `restore.go`, `internal/ch` (cloud-hypervisor API), `internal/kata` |
+| `ateom-gvisor` | `main.go` (Run/Checkpoint/Restore), `runsc.go`, `sandboxnet.go`, `hosted.go` |
+| `ateom-microvm` | `run.go`, `checkpoint.go`, `restore.go`, `hosted.go`, `internal/ch` (cloud-hypervisor API), `internal/kata` |
 | `atenet` | `internal/root.go` → `internal/router/{ingress,extproc,…}`, `internal/sdsmint` |
 | `atecontroller` | `internal/controllers` (WorkerPool → Deployment/NetworkPolicy, MITM trust), `internal/workersync` |
 | `podcertcontroller`, `credential-provider` | Small; PodCertificate signers, and `ate-secret://` resolution |
@@ -58,7 +58,7 @@ Items marked ⚠ are dangerous to modify; the reason follows each one.
 8. `cmd/ateapi/internal/controlapi/template_reconciler.go`: builds golden
    snapshots.
 9. `cmd/ateapi/internal/store/store.go`: `store.Interface` and the
-   `Precondition` semantics (uid + version compare-and-swap).
+   `Precondition` semantics (uid + version compare-and-swap). Its Postgres implementation under `cmd/ateapi/internal/store/atepg/` is split into resource-specific files (like `actor.go`, `worker.go`, `tag.go`).
 10. `cmd/ateapi/internal/store/atepg/migrations/000001_initial.sql`. ⚠ It has
     already been applied to clusters, and CI checks that migrations are
     immutable. Add a new migration instead of editing this one; see
@@ -74,8 +74,7 @@ Items marked ⚠ are dangerous to modify; the reason follows each one.
     snapshot manifest, so old snapshots must keep parsing.
 15. `cmd/atelet/internal/ategcs/sparsezstd.go`. ⚠ The `ATESPRSE` v2 on-object
     format and `.zstd` naming are read back from existing snapshots.
-16. `internal/ateompath/ateompath.go`. ⚠ This path layout is shared by atelet
-    and both ateoms, and paths are baked into OCI specs and micro-VM snapshots.
+16. `cmd/atelet/internal/ateletpath/ateletpath.go` and `internal/nodepath/nodepath.go`. ⚠ Separates atelet's private paths and shared node path constants under `/var/lib/ateom-gvisor`. Path structures are increasingly passed over RPC using `ActorDirs` protobuf messages to decouple components.
 17. `internal/imagecache/imagecache.go`. ⚠ On-disk layout version "1" is read
     by GC.
 18. `cmd/ateom-gvisor/main.go` and `cmd/ateom-microvm/restore.go`: the sandbox

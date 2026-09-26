@@ -1,6 +1,6 @@
 # Open questions
 
-*Opened 2026-09-23 against `985c2002`. Remove an entry once it is answered.*
+*Opened 2026-09-26 against `c7b54699`. Remove an entry once it is answered.*
 
 ## Behavior the code leaves ambiguous
 
@@ -24,10 +24,6 @@
   `internal/authz/model.fga`) runs migrations at ateapi start, but no request
   path calls Check; there are only `TODO(authz)` markers. Until then, any
   authenticated principal can call any RPC.
-- **Multi-actor workers.** The scheduler, `WorkerResources.actors` and
-  `HasRoom` all model N actors per worker, but `internal/ateomcapacity` hard-codes
-  `actorsPerAteom = 1`, and the glossary says "at most one". Is N>1 planned,
-  and which ateom changes does it need?
 - **atelet → ateom uses insecure gRPC** over a hostPath unix socket
   (`cmd/atelet/main.go` `DialAteomPod`). Is filesystem permission on the
   shared BasePath the intended boundary?

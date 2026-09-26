@@ -1,6 +1,6 @@
 # Architecture
 
-*Derived from code at `985c2002` (2026-09-23). File references are relative to the repo root.*
+*Derived from code at `c7b54699` (2026-09-26). File references are relative to the repo root.*
 
 ## Components
 
@@ -60,11 +60,7 @@ ateapi itself. It runs as a non-blocking CI lane.
   `internal/proto/ateompb` holds `Ateom` (atelet → ateom).
 - **CRDs**: WorkerPool, SandboxConfig and CSIDriverConfig in
   `pkg/api/v1alpha1`. The generated client is in `pkg/client`.
-- **Store**: `store.Interface` (`cmd/ateapi/internal/store/store.go`). The
-  only implementation is Postgres (`store/atepg`), which stores each object
-  as a proto bytea plus `uid` and `version`. Goose migrations are in
-  `atepg/migrations/`. Worker changes reach watchers through a transactional
-  outbox (`atepg/outbox.go`).
+- **Store**: `store.Interface` (`cmd/ateapi/internal/store/store.go`). Postgres (`store/atepg`) implements this interface, with database tables split into modular resource-specific files (e.g. `actor.go`, `tag.go`, `worker.go`). Goose migrations live in `atepg/migrations/`. Worker changes reach watchers through a transactional outbox (`atepg/outbox.go`).
 - **Workflows**: `controlapi/workflow_*.go`. Each is a sequence of idempotent
   `ensure*` steps run under a per-actor Postgres lease
   (`lease:actor:<atespace>:<name>`).
@@ -72,8 +68,7 @@ ateapi itself. It runs as a non-blocking CI lane.
   `Applies` (class, state, selectors, nodes) and `HasRoom` (resources and
   actor count), then picks at random. `BindActorToWorker` re-checks under
   `SELECT … FOR UPDATE`.
-- **On-node layout**: `internal/ateompath` is the path contract that atelet
-  and both ateoms share under `/var/lib/ateom-gvisor`.
+- **On-node layout**: Node paths are decoupled under `/var/lib/ateom-gvisor`. `cmd/atelet/internal/ateletpath` handles atelet's private paths, shared path constants live in `internal/nodepath`, and individual ateoms derive paths from `internal/ateompath`. Per-actor directory paths are passed over RPC using the `ActorDirs` protobuf message to reduce path coupling.
 
 ## Actor lifecycle
 
