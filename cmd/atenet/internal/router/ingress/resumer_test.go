@@ -1,0 +1,1047 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package ingress
+
+import (
+	"context"
+	"errors"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"testing/synctest"
+	"time"
+
+	"github.com/agent-substrate/substrate/cmd/atenet/internal/router/extproc"
+	"github.com/agent-substrate/substrate/internal/resources"
+	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	envoy_type "github.com/envoyproxy/go-control-plane/envoy/type/v3"
+	"go.opentelemetry.io/otel/trace"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+)
+
+type resumerMockClient struct {
+	ateapipb.ControlClient
+	resumeFn func(ctx context.Context, in *ateapipb.ResumeActorRequest, opts ...grpc.CallOption) (*ateapipb.ResumeActorResponse, error)
+}
+
+func (m *resumerMockClient) ResumeActor(ctx context.Context, in *ateapipb.ResumeActorRequest, opts ...grpc.CallOption) (*ateapipb.ResumeActorResponse, error) {
+	if m.resumeFn != nil {
+		return m.resumeFn(ctx, in, opts...)
+	}
+	return nil, status.Error(codes.Unimplemented, "unimplemented")
+}
+
+func TestActorResumer_ResumeActor(t *testing.T) {
+	const testActorName = "actor-a"
+	const testAtespace = "team-a"
+	const expectedIP = "10.0.0.52"
+
+	testActorRef := resources.ActorRef{Atespace: testAtespace, Name: testActorName}
+
+	t.Run("SuspendedResumedSuccessfully", func(t *testing.T) {
+		var resumeCalled int
+		mock := &resumerMockClient{
+			resumeFn: func(ctx context.Context, in *ateapipb.ResumeActorRequest, opts ...grpc.CallOption) (*ateapipb.ResumeActorResponse, error) {
+				resumeCalled++
+				return &ateapipb.ResumeActorResponse{
+					Actor: &ateapipb.Actor{
+						Status: &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_RUNNING, WorkerAssignment: &ateapipb.WorkerAssignment{WorkerPodIp: expectedIP}},
+					},
+					Resumed: true,
+				}, nil
+			},
+		}
+
+		resumer := NewActorResumer(mock)
+		actor, outcome, err := resumer.ResumeActor(context.Background(), testActorRef)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if actor.GetStatus().GetWorkerAssignment().GetWorkerPodIp() != expectedIP {
+			t.Errorf("expected IP %q, got %q", expectedIP, actor.GetStatus().GetWorkerAssignment().GetWorkerPodIp())
+		}
+		if outcome != ResumeOutcomeTriggered {
+			t.Errorf("expected outcome %q, got %q", ResumeOutcomeTriggered, outcome)
+		}
+		if resumeCalled != 1 {
+			t.Errorf("expected ResumeActor called 1 time, got %d", resumeCalled)
+		}
+	})
+
+	t.Run("WarmRouting_Disambiguation", func(t *testing.T) {
+		mock := &resumerMockClient{
+			resumeFn: func(ctx context.Context, in *ateapipb.ResumeActorRequest, opts ...grpc.CallOption) (*ateapipb.ResumeActorResponse, error) {
+				return &ateapipb.ResumeActorResponse{
+					Actor: &ateapipb.Actor{
+						Metadata: &ateapipb.ResourceMetadata{Name: testActorName},
+						Status:   &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_RUNNING, WorkerAssignment: &ateapipb.WorkerAssignment{WorkerPodIp: expectedIP}},
+					},
+					Resumed: false,
+				}, nil
+			},
+		}
+
+		resumer := NewActorResumer(mock)
+		_, outcome, err := resumer.ResumeActor(context.Background(), testActorRef)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if outcome != ResumeOutcomeNone {
+			t.Errorf("expected outcome %q for warm routing, got %q", ResumeOutcomeNone, outcome)
+		}
+	})
+
+	t.Run("RetryOnAbortedConflict", func(t *testing.T) {
+		var resumeCalled int
+		mock := &resumerMockClient{
+			resumeFn: func(ctx context.Context, in *ateapipb.ResumeActorRequest, opts ...grpc.CallOption) (*ateapipb.ResumeActorResponse, error) {
+				resumeCalled++
+				if resumeCalled < 3 {
+					return nil, status.Error(codes.Aborted, "concurrent update conflict")
+				}
+				return &ateapipb.ResumeActorResponse{
+					Actor: &ateapipb.Actor{
+						Status: &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_RUNNING, WorkerAssignment: &ateapipb.WorkerAssignment{WorkerPodIp: expectedIP}},
+					},
+					Resumed: true,
+				}, nil
+			},
+		}
+
+		resumer := NewActorResumer(mock)
+		actor, outcome, err := resumer.ResumeActor(context.Background(), testActorRef)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if actor.GetStatus().GetWorkerAssignment().GetWorkerPodIp() != expectedIP {
+			t.Errorf("expected IP %q, got %q", expectedIP, actor.GetStatus().GetWorkerAssignment().GetWorkerPodIp())
+		}
+		if outcome != ResumeOutcomeTriggered {
+			t.Errorf("expected outcome %q, got %q", ResumeOutcomeTriggered, outcome)
+		}
+		if resumeCalled != 3 {
+			t.Errorf("expected ResumeActor called 3 times, got %d", resumeCalled)
+		}
+	})
+
+	t.Run("ActorNotFound", func(t *testing.T) {
+		mock := &resumerMockClient{
+			resumeFn: func(ctx context.Context, in *ateapipb.ResumeActorRequest, opts ...grpc.CallOption) (*ateapipb.ResumeActorResponse, error) {
+				return nil, status.Error(codes.NotFound, "not found")
+			},
+		}
+
+		resumer := NewActorResumer(mock)
+		_, outcome, err := resumer.ResumeActor(context.Background(), testActorRef)
+		if got := status.Code(err); got != codes.NotFound {
+			t.Errorf("expected gRPC code NotFound, got %v (err=%v)", got, err)
+		}
+		if outcome != ResumeOutcomeUnknown {
+			t.Errorf("expected outcome %q on a failed resume, got %q", ResumeOutcomeUnknown, outcome)
+		}
+	})
+
+	t.Run("CallerContextCanceled", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		// The caller selects on its own context and on the flight's completion.
+		// Hold the flight open for the whole call, so only the cancellation can
+		// be ready. A flight that can finish first makes both cases ready, and
+		// the select picks one of them at random.
+		gate := make(chan struct{})
+		defer close(gate)
+
+		mock := &resumerMockClient{
+			resumeFn: func(ctx context.Context, in *ateapipb.ResumeActorRequest, opts ...grpc.CallOption) (*ateapipb.ResumeActorResponse, error) {
+				<-gate
+				return &ateapipb.ResumeActorResponse{Resumed: true}, nil
+			},
+		}
+
+		resumer := NewActorResumer(mock)
+		_, outcome, err := resumer.ResumeActor(ctx, testActorRef)
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("expected context.Canceled, got %v", err)
+		}
+		if outcome != ResumeOutcomeUnknown {
+			t.Errorf("expected outcome %q on a canceled caller, got %q", ResumeOutcomeUnknown, outcome)
+		}
+	})
+
+	// A failed resume tells no caller whether an activation ran — the leader no
+	// more than the joiners — so every caller on the flight reports "unknown".
+	t.Run("SingleflightDeduplication_FailedFlight", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			const concurrentRequests = 10
+			var resumeCalled atomic.Int32
+			gate := make(chan struct{})
+
+			mock := &resumerMockClient{
+				resumeFn: func(ctx context.Context, in *ateapipb.ResumeActorRequest, opts ...grpc.CallOption) (*ateapipb.ResumeActorResponse, error) {
+					resumeCalled.Add(1)
+					<-gate
+					return nil, status.Error(codes.ResourceExhausted, "no free workers available")
+				},
+			}
+
+			resumer := NewActorResumer(mock)
+
+			var wg sync.WaitGroup
+			outcomes := make([]ResumeOutcome, concurrentRequests)
+			errs := make([]error, concurrentRequests)
+
+			wg.Add(concurrentRequests)
+			for i := 0; i < concurrentRequests; i++ {
+				go func(idx int) {
+					defer wg.Done()
+					_, outcomes[idx], errs[idx] = resumer.ResumeActor(context.Background(), testActorRef)
+				}(i)
+			}
+			// synctest.Wait returns once every caller is parked on the flight,
+			// so the release below cannot beat one of them to it. The flight
+			// leaves the registry when it completes, so a caller that arrived
+			// after that would start its own RPC and fail the count below.
+			synctest.Wait()
+			close(gate)
+			wg.Wait()
+
+			for i := 0; i < concurrentRequests; i++ {
+				if got := status.Code(errs[i]); got != codes.ResourceExhausted {
+					t.Fatalf("request %d expected ResourceExhausted, got %v", i, errs[i])
+				}
+				if outcomes[i] != ResumeOutcomeUnknown {
+					t.Errorf("request %d: expected outcome %q on a failed flight, got %q", i, ResumeOutcomeUnknown, outcomes[i])
+				}
+			}
+
+			if calls := resumeCalled.Load(); calls != 1 {
+				t.Errorf("ResumeActor calls = %d, want 1 for %d concurrent callers", calls, concurrentRequests)
+			}
+		})
+	})
+
+	t.Run("SingleflightDeduplication_Disambiguation", func(t *testing.T) {
+		var resumeCalled int
+		var mu sync.Mutex
+
+		mock := &resumerMockClient{
+			resumeFn: func(ctx context.Context, in *ateapipb.ResumeActorRequest, opts ...grpc.CallOption) (*ateapipb.ResumeActorResponse, error) {
+				mu.Lock()
+				resumeCalled++
+				mu.Unlock()
+				time.Sleep(20 * time.Millisecond)
+				return &ateapipb.ResumeActorResponse{
+					Actor: &ateapipb.Actor{
+						Status: &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_RUNNING, WorkerAssignment: &ateapipb.WorkerAssignment{WorkerPodIp: expectedIP}},
+					},
+					Resumed: true,
+				}, nil
+			},
+		}
+
+		resumer := NewActorResumer(mock)
+
+		var wg sync.WaitGroup
+		const concurrentRequests = 10
+		results := make([]*ateapipb.Actor, concurrentRequests)
+		outcomes := make([]ResumeOutcome, concurrentRequests)
+		errs := make([]error, concurrentRequests)
+
+		wg.Add(concurrentRequests)
+		for i := 0; i < concurrentRequests; i++ {
+			go func(idx int) {
+				defer wg.Done()
+				results[idx], outcomes[idx], errs[idx] = resumer.ResumeActor(context.Background(), testActorRef)
+			}(i)
+		}
+		wg.Wait()
+
+		var triggeredCount, joinedCount int
+		for i := 0; i < concurrentRequests; i++ {
+			if errs[i] != nil {
+				t.Fatalf("request %d failed: %v", i, errs[i])
+			}
+			if results[i].GetStatus().GetWorkerAssignment().GetWorkerPodIp() != expectedIP {
+				t.Errorf("request %d expected IP %q, got %q", i, expectedIP, results[i].GetStatus().GetWorkerAssignment().GetWorkerPodIp())
+			}
+			switch outcomes[i] {
+			case ResumeOutcomeTriggered:
+				triggeredCount++
+			case ResumeOutcomeJoined:
+				joinedCount++
+			default:
+				t.Errorf("unexpected outcome for request %d: %q", i, outcomes[i])
+			}
+		}
+
+		if triggeredCount != 1 {
+			t.Errorf("expected exactly 1 request to have outcome 'triggered', got %d", triggeredCount)
+		}
+		if joinedCount != concurrentRequests-1 {
+			t.Errorf("expected %d requests to have outcome 'joined', got %d", concurrentRequests-1, joinedCount)
+		}
+
+		mu.Lock()
+		defer mu.Unlock()
+		if resumeCalled != 1 {
+			t.Errorf("expected ResumeActor called exactly once by singleflight, got %d", resumeCalled)
+		}
+	})
+}
+
+// TestActorResumer_Parking runs each case inside a synctest bubble, so the
+// parked retry loop's waits are fake time.
+func TestActorResumer_Parking(t *testing.T) {
+	const (
+		testActorName = "actor-park"
+		testAtespace  = "team-a"
+		expectedIP    = "10.0.0.77"
+	)
+	testActorRef := resources.ActorRef{Atespace: testAtespace, Name: testActorName}
+
+	t.Run("ParksThenSucceedsOnCapacityError", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			var mu sync.Mutex
+			var calls int
+			mock := &resumerMockClient{
+				resumeFn: func(ctx context.Context, in *ateapipb.ResumeActorRequest, opts ...grpc.CallOption) (*ateapipb.ResumeActorResponse, error) {
+					mu.Lock()
+					calls++
+					n := calls
+					mu.Unlock()
+					if n < 3 {
+						// Worker pool momentarily saturated.
+						return nil, status.Error(codes.FailedPrecondition, "no free workers available")
+					}
+					return &ateapipb.ResumeActorResponse{
+						Actor: &ateapipb.Actor{Metadata: &ateapipb.ResourceMetadata{Name: testActorName}, Status: &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_RUNNING, WorkerAssignment: &ateapipb.WorkerAssignment{WorkerPodIp: expectedIP}}},
+					}, nil
+				},
+			}
+
+			resumer := NewActorResumer(mock, withParking(ParkedRequestConfig{Max: 1, Budget: 5 * time.Second}))
+			actor, _, err := resumer.ResumeActor(context.Background(), testActorRef)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if actor.GetStatus().GetWorkerAssignment().GetWorkerPodIp() != expectedIP {
+				t.Errorf("expected IP %q, got %q", expectedIP, actor.GetStatus().GetWorkerAssignment().GetWorkerPodIp())
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if calls != 3 {
+				t.Errorf("expected 3 resume attempts (parked through 2 capacity errors), got %d", calls)
+			}
+		})
+	})
+
+	t.Run("BudgetExpiryReturnsUnderlyingCapacityError", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			var mu sync.Mutex
+			var calls int
+			mock := &resumerMockClient{
+				resumeFn: func(ctx context.Context, in *ateapipb.ResumeActorRequest, opts ...grpc.CallOption) (*ateapipb.ResumeActorResponse, error) {
+					mu.Lock()
+					calls++
+					mu.Unlock()
+					return nil, status.Error(codes.FailedPrecondition, "no free workers available")
+				},
+			}
+
+			// Budget large enough for a few ~100ms-spaced retries before it elapses;
+			// the pool never frees up.
+			resumer := NewActorResumer(mock, withParking(ParkedRequestConfig{Max: 1, Budget: 1500 * time.Millisecond}))
+			_, _, err := resumer.ResumeActor(context.Background(), testActorRef)
+			// The client must see the meaningful capacity error, not a generic
+			// timeout: status.Code must unwrap through the budget-exhaustion marker.
+			if got := status.Code(err); got != codes.FailedPrecondition {
+				t.Errorf("expected FailedPrecondition after park budget elapsed, got %v (err=%v)", got, err)
+			}
+			var budget *budgetExhaustedError
+			if !errors.As(err, &budget) {
+				t.Errorf("expected the error to be marked as budget exhaustion, got %T (%v)", err, err)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if calls < 2 {
+				t.Errorf("expected the resume to be retried at least twice while parked, got %d", calls)
+			}
+		})
+	})
+
+	t.Run("ParksThroughUnavailableBlip", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			var mu sync.Mutex
+			var calls int
+			mock := &resumerMockClient{
+				resumeFn: func(ctx context.Context, in *ateapipb.ResumeActorRequest, opts ...grpc.CallOption) (*ateapipb.ResumeActorResponse, error) {
+					mu.Lock()
+					calls++
+					n := calls
+					mu.Unlock()
+					if n < 3 {
+						// Control plane momentarily unreachable (e.g. rolling restart).
+						return nil, status.Error(codes.Unavailable, "connection refused")
+					}
+					return &ateapipb.ResumeActorResponse{
+						Actor: &ateapipb.Actor{Metadata: &ateapipb.ResourceMetadata{Name: testActorName}, Status: &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_RUNNING, WorkerAssignment: &ateapipb.WorkerAssignment{WorkerPodIp: expectedIP}}},
+					}, nil
+				},
+			}
+
+			resumer := NewActorResumer(mock, withParking(ParkedRequestConfig{Max: 1, Budget: 5 * time.Second}))
+			actor, _, err := resumer.ResumeActor(context.Background(), testActorRef)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if actor.GetStatus().GetWorkerAssignment().GetWorkerPodIp() != expectedIP {
+				t.Errorf("expected IP %q, got %q", expectedIP, actor.GetStatus().GetWorkerAssignment().GetWorkerPodIp())
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if calls != 3 {
+				t.Errorf("expected 3 resume attempts (parked through 2 Unavailable blips), got %d", calls)
+			}
+		})
+	})
+
+	t.Run("DisabledFailsFastOnUnavailable", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			var mu sync.Mutex
+			var calls int
+			mock := &resumerMockClient{
+				resumeFn: func(ctx context.Context, in *ateapipb.ResumeActorRequest, opts ...grpc.CallOption) (*ateapipb.ResumeActorResponse, error) {
+					mu.Lock()
+					calls++
+					mu.Unlock()
+					return nil, status.Error(codes.Unavailable, "connection refused")
+				},
+			}
+
+			resumer := NewActorResumer(mock)
+			_, _, err := resumer.ResumeActor(context.Background(), testActorRef)
+			if got := status.Code(err); got != codes.Unavailable {
+				t.Errorf("expected Unavailable, got %v (err=%v)", got, err)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if calls != 1 {
+				t.Errorf("expected exactly 1 resume attempt when parking disabled, got %d", calls)
+			}
+		})
+	})
+
+	t.Run("InFlightAttemptRunsToCompletion", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			// The core of #675: an attempt still running when the budget
+			// elapses is NEVER canceled — ateapi has already claimed a worker
+			// for it, and canceling would discard the restore and strand that
+			// worker. The attempt runs to completion and its success is served,
+			// while no new attempt starts after the budget.
+			const budget = 300 * time.Millisecond
+			var mu sync.Mutex
+			var calls int
+			var attemptStarts []time.Duration
+			var ctxErrAtReturn error
+			base := time.Now()
+			mock := &resumerMockClient{
+				resumeFn: func(ctx context.Context, in *ateapipb.ResumeActorRequest, opts ...grpc.CallOption) (*ateapipb.ResumeActorResponse, error) {
+					mu.Lock()
+					calls++
+					n := calls
+					attemptStarts = append(attemptStarts, time.Since(base))
+					mu.Unlock()
+					if n == 1 {
+						return nil, status.Error(codes.ResourceExhausted, "no free workers available")
+					}
+					// The restore overshoots the budget, as it routinely does
+					// under CI node contention.
+					time.Sleep(budget)
+					mu.Lock()
+					ctxErrAtReturn = ctx.Err()
+					mu.Unlock()
+					return &ateapipb.ResumeActorResponse{
+						Actor:   &ateapipb.Actor{Metadata: &ateapipb.ResourceMetadata{Name: testActorName}, Status: &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_RUNNING, WorkerAssignment: &ateapipb.WorkerAssignment{WorkerPodIp: expectedIP}}},
+						Resumed: true,
+					}, nil
+				},
+			}
+
+			resumer := NewActorResumer(mock, withParking(ParkedRequestConfig{Max: 1, Budget: budget}))
+			actor, _, err := resumer.ResumeActor(context.Background(), testActorRef)
+			if err != nil {
+				t.Fatalf("expected the overshooting resume to be served, got %v", err)
+			}
+			if actor.GetStatus().GetWorkerAssignment().GetWorkerPodIp() != expectedIP {
+				t.Errorf("expected IP %q, got %q", expectedIP, actor.GetStatus().GetWorkerAssignment().GetWorkerPodIp())
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if ctxErrAtReturn != nil {
+				t.Errorf("the in-flight attempt's context was canceled (%v); the budget must never cancel an attempt", ctxErrAtReturn)
+			}
+			for i, s := range attemptStarts {
+				if s >= budget {
+					t.Errorf("attempt %d started at %v, after the %v budget: retries must stop at the budget", i+1, s, budget)
+				}
+			}
+		})
+	})
+
+	t.Run("LateRetryableErrorIsBudgetExhaustion", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			// An attempt that outlives the budget and then fails with a
+			// retryable error must classify as budget exhaustion — the
+			// meaningful capacity 503, not a generic timeout 504.
+			const budget = 300 * time.Millisecond
+			var mu sync.Mutex
+			var calls int
+			mock := &resumerMockClient{
+				resumeFn: func(ctx context.Context, in *ateapipb.ResumeActorRequest, opts ...grpc.CallOption) (*ateapipb.ResumeActorResponse, error) {
+					mu.Lock()
+					calls++
+					mu.Unlock()
+					time.Sleep(budget + 100*time.Millisecond)
+					return nil, status.Error(codes.ResourceExhausted, "no free workers available")
+				},
+			}
+
+			resumer := NewActorResumer(mock, withParking(ParkedRequestConfig{Max: 1, Budget: budget}))
+			_, _, err := resumer.ResumeActor(context.Background(), testActorRef)
+			if got := status.Code(err); got != codes.ResourceExhausted {
+				t.Errorf("expected ResourceExhausted after a late retryable failure, got %v (err=%v)", got, err)
+			}
+			var budgetErr *budgetExhaustedError
+			if !errors.As(err, &budgetErr) {
+				t.Errorf("expected the error to be marked as budget exhaustion, got %T (%v)", err, err)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if calls != 1 {
+				t.Errorf("expected exactly 1 attempt (no retry after the budget), got %d", calls)
+			}
+		})
+	})
+
+	t.Run("DisabledFailsFastOnCapacityError", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			var mu sync.Mutex
+			var calls int
+			mock := &resumerMockClient{
+				resumeFn: func(ctx context.Context, in *ateapipb.ResumeActorRequest, opts ...grpc.CallOption) (*ateapipb.ResumeActorResponse, error) {
+					mu.Lock()
+					calls++
+					mu.Unlock()
+					return nil, status.Error(codes.FailedPrecondition, "no free workers available")
+				},
+			}
+
+			// Default constructor => parking disabled => fail-fast.
+			resumer := NewActorResumer(mock)
+			_, _, err := resumer.ResumeActor(context.Background(), testActorRef)
+			if got := status.Code(err); got != codes.FailedPrecondition {
+				t.Errorf("expected FailedPrecondition, got %v (err=%v)", got, err)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if calls != 1 {
+				t.Errorf("expected exactly 1 resume attempt when parking disabled, got %d", calls)
+			}
+		})
+	})
+}
+
+// TestActorResumer_CallerCancelDoesNotAbortFlight pins the detached-context
+// contract from both sides: a caller that disconnects while parked gets
+// context.Canceled (classified as the `canceled` outcome) WITHOUT aborting the
+// shared in-flight resume, which keeps running and serves a later caller from
+// the same single RPC.
+func TestActorResumer_CallerCancelDoesNotAbortFlight(t *testing.T) {
+	synctest.Test(t, testCallerCancelDoesNotAbortFlight)
+}
+
+func testCallerCancelDoesNotAbortFlight(t *testing.T) {
+	const (
+		testActorName = "actor-cancel"
+		testAtespace  = "team-a"
+		expectedIP    = "10.0.0.88"
+	)
+	testActorRef := resources.ActorRef{Atespace: testAtespace, Name: testActorName}
+
+	var mu sync.Mutex
+	var calls int
+	started := make(chan struct{})
+	proceed := make(chan struct{})
+	mock := &resumerMockClient{
+		resumeFn: func(ctx context.Context, in *ateapipb.ResumeActorRequest, opts ...grpc.CallOption) (*ateapipb.ResumeActorResponse, error) {
+			mu.Lock()
+			calls++
+			n := calls
+			mu.Unlock()
+			if n == 1 {
+				close(started)
+			}
+			// Hold the flight open until the test releases it.
+			<-proceed
+			return &ateapipb.ResumeActorResponse{
+				Actor: &ateapipb.Actor{Metadata: &ateapipb.ResourceMetadata{Name: testActorName}, Status: &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_RUNNING, WorkerAssignment: &ateapipb.WorkerAssignment{WorkerPodIp: expectedIP}}},
+			}, nil
+		},
+	}
+
+	resumer := NewActorResumer(mock, withParking(ParkedRequestConfig{Max: 2, Budget: 5 * time.Second}))
+
+	// Caller 1 starts the flight, then disconnects while parked.
+	ctx1, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		_, _, err := resumer.ResumeActor(ctx1, testActorRef)
+		errCh <- err
+	}()
+	<-started
+	cancel()
+
+	err := <-errCh
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("disconnected caller: expected context.Canceled, got %v", err)
+	}
+	if got := parkOutcomeFor(err); got != parkOutcomeCanceled {
+		t.Errorf("disconnected caller outcome = %q, want %q", got, parkOutcomeCanceled)
+	}
+
+	// Caller 2 arrives after caller 1 left; the flight is still in its first
+	// RPC, so it must join that flight rather than start a new one.
+	type result struct {
+		actor *ateapipb.Actor
+		err   error
+	}
+	resCh := make(chan result, 1)
+	go func() {
+		a, _, rerr := resumer.ResumeActor(context.Background(), testActorRef)
+		resCh <- result{a, rerr}
+	}()
+	// Let caller 2 reach the flight before releasing it, so the call-count
+	// assertion proves it shared the first RPC. Inside the bubble this is exact
+	// rather than a hopeful sleep: Wait blocks until every other goroutine here
+	// — caller 2 included — is durably blocked, i.e. parked on the flight.
+	synctest.Wait()
+	close(proceed)
+
+	res := <-resCh
+	if res.err != nil {
+		t.Fatalf("second caller: unexpected error: %v", res.err)
+	}
+	if res.actor.GetStatus().GetWorkerAssignment().GetWorkerPodIp() != expectedIP {
+		t.Errorf("second caller IP = %q, want %q", res.actor.GetStatus().GetWorkerAssignment().GetWorkerPodIp(), expectedIP)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if calls != 1 {
+		t.Errorf("expected the canceled caller's flight to be shared (1 RPC), got %d", calls)
+	}
+}
+
+// TestActorResumer_LotAdmission pins WHEN a caller occupies a parking-lot
+// slot: never while its flight is resolving, always while it is parked, and
+// shed at the park transition when the lot is full (issue #1081). Timed cases
+// run inside synctest bubbles so the parked retry loop's waits are fake time.
+func TestActorResumer_LotAdmission(t *testing.T) {
+	const (
+		testActorName = "actor-lot"
+		testAtespace  = "team-a"
+		expectedIP    = "10.0.0.99"
+	)
+	testActorRef := resources.ActorRef{Atespace: testAtespace, Name: testActorName}
+	runningResp := func() *ateapipb.ResumeActorResponse {
+		return &ateapipb.ResumeActorResponse{
+			Actor: &ateapipb.Actor{
+				Metadata: &ateapipb.ResourceMetadata{Name: testActorName},
+				Status: &ateapipb.ActorStatus{
+					State:            ateapipb.ActorState_ACTOR_STATE_RUNNING,
+					WorkerAssignment: &ateapipb.WorkerAssignment{WorkerPodIp: expectedIP},
+				},
+			},
+			Resumed: true,
+		}
+	}
+
+	t.Run("FastFlightNeverEntersLot", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			mock := &resumerMockClient{
+				resumeFn: func(
+					ctx context.Context,
+					in *ateapipb.ResumeActorRequest,
+					opts ...grpc.CallOption,
+				) (*ateapipb.ResumeActorResponse, error) {
+					return runningResp(), nil
+				},
+			}
+			cfg := ParkedRequestConfig{Max: 1, Budget: 5 * time.Second}
+			lot := newParkingLot(cfg, nil)
+			// Fill the only slot: any lot entry would shed, so success proves
+			// the fast path never asked.
+			release, ok := lot.enter(context.Background())
+			if !ok {
+				t.Fatal("priming enter should be admitted")
+			}
+			defer release(parkOutcomeServed)
+
+			resumer := NewActorResumer(mock, withParking(cfg), withParkingLot(lot))
+			actor, _, err := resumer.ResumeActor(context.Background(), testActorRef)
+			if err != nil {
+				t.Fatalf("a first-attempt resolution must be served despite a full lot: %v", err)
+			}
+			if actor.GetStatus().GetWorkerAssignment().GetWorkerPodIp() != expectedIP {
+				t.Errorf("expected IP %q, got %q", expectedIP, actor.GetStatus().GetWorkerAssignment().GetWorkerPodIp())
+			}
+			if got := lot.activeCount(); got != 1 {
+				t.Errorf("fast path must not take a slot; active = %d, want 1 (the priming entry)", got)
+			}
+		})
+	})
+
+	t.Run("ParkTransitionAcquiresSlot", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			cfg := ParkedRequestConfig{Max: 2, Budget: 5 * time.Second}
+			lot := newParkingLot(cfg, nil)
+			var mu sync.Mutex
+			var calls, activeDuringRetry int
+			mock := &resumerMockClient{
+				resumeFn: func(
+					ctx context.Context,
+					in *ateapipb.ResumeActorRequest,
+					opts ...grpc.CallOption,
+				) (*ateapipb.ResumeActorResponse, error) {
+					mu.Lock()
+					calls++
+					n := calls
+					mu.Unlock()
+					if n == 1 {
+						return nil, status.Error(codes.ResourceExhausted, "no free workers available")
+					}
+					// By the retry, the parked caller must already hold its
+					// slot: the bubble advances past the backoff sleep only
+					// once every goroutine — the caller included — is blocked.
+					mu.Lock()
+					activeDuringRetry = lot.activeCount()
+					mu.Unlock()
+					return runningResp(), nil
+				},
+			}
+
+			resumer := NewActorResumer(mock, withParking(cfg), withParkingLot(lot))
+			actor, _, err := resumer.ResumeActor(context.Background(), testActorRef)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if actor.GetStatus().GetWorkerAssignment().GetWorkerPodIp() != expectedIP {
+				t.Errorf("expected IP %q, got %q", expectedIP, actor.GetStatus().GetWorkerAssignment().GetWorkerPodIp())
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if activeDuringRetry != 1 {
+				t.Errorf("caller must hold a slot while its flight is parked; active during retry = %d, want 1", activeDuringRetry)
+			}
+			if got := lot.activeCount(); got != 0 {
+				t.Errorf("slot must be released when the wait ends; active = %d, want 0", got)
+			}
+		})
+	})
+
+	t.Run("ShedWhenLotFullAtParkTransition", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			cfg := ParkedRequestConfig{Max: 1, Budget: 500 * time.Millisecond}
+			lot := newParkingLot(cfg, nil)
+			release, ok := lot.enter(context.Background())
+			if !ok {
+				t.Fatal("priming enter should be admitted")
+			}
+			defer release(parkOutcomeServed)
+
+			var mu sync.Mutex
+			var calls int
+			mock := &resumerMockClient{
+				resumeFn: func(
+					ctx context.Context,
+					in *ateapipb.ResumeActorRequest,
+					opts ...grpc.CallOption,
+				) (*ateapipb.ResumeActorResponse, error) {
+					mu.Lock()
+					calls++
+					mu.Unlock()
+					return nil, status.Error(codes.ResourceExhausted, "no free workers available")
+				},
+			}
+
+			resumer := NewActorResumer(mock, withParking(cfg), withParkingLot(lot))
+			_, outcome, err := resumer.ResumeActor(context.Background(), testActorRef)
+			var reqErr *extproc.ReqError
+			if !errors.As(err, &reqErr) || reqErr.StatusCode != int(envoy_type.StatusCode_ServiceUnavailable) {
+				t.Fatalf("expected a 503 router-at-capacity denial, got %v", err)
+			}
+			if outcome != ResumeOutcomeUnknown {
+				t.Errorf("shed caller outcome = %q, want %q", outcome, ResumeOutcomeUnknown)
+			}
+			// The caller was turned away at the transition: exactly one attempt
+			// had run.
+			mu.Lock()
+			if calls != 1 {
+				t.Errorf("expected the caller shed after exactly 1 attempt, got %d", calls)
+			}
+			mu.Unlock()
+
+			// Its abandoned flight retries on until the budget; sleep (fake
+			// time) past it so the flight exits before the bubble does.
+			time.Sleep(600 * time.Millisecond)
+		})
+	})
+
+	t.Run("JoinerToParkedFlightNeedsSlot", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			cfg := ParkedRequestConfig{Max: 1, Budget: 5 * time.Second}
+			lot := newParkingLot(cfg, nil)
+			var mu sync.Mutex
+			var calls int
+			proceed := make(chan struct{})
+			mock := &resumerMockClient{
+				resumeFn: func(
+					ctx context.Context,
+					in *ateapipb.ResumeActorRequest,
+					opts ...grpc.CallOption,
+				) (*ateapipb.ResumeActorResponse, error) {
+					mu.Lock()
+					calls++
+					n := calls
+					mu.Unlock()
+					if n == 1 {
+						return nil, status.Error(codes.ResourceExhausted, "no free workers available")
+					}
+					<-proceed
+					return runningResp(), nil
+				},
+			}
+			resumer := NewActorResumer(mock, withParking(cfg), withParkingLot(lot))
+
+			// The leader parks and takes the lot's only slot.
+			type result struct {
+				actor   *ateapipb.Actor
+				outcome ResumeOutcome
+				err     error
+			}
+			leaderCh := make(chan result, 1)
+			go func() {
+				a, o, err := resumer.ResumeActor(context.Background(), testActorRef)
+				leaderCh <- result{a, o, err}
+			}()
+			// Wait blocks until the leader is durably parked again — past the
+			// non-blocking lot entry, i.e. holding the slot.
+			synctest.Wait()
+
+			// A joiner attaching to the already-parked flight must take its own
+			// slot; the lot is full, so it is shed while the leader keeps waiting.
+			_, outcome, err := resumer.ResumeActor(context.Background(), testActorRef)
+			var reqErr *extproc.ReqError
+			if !errors.As(err, &reqErr) || reqErr.StatusCode != int(envoy_type.StatusCode_ServiceUnavailable) {
+				t.Fatalf("joiner: expected a 503 router-at-capacity denial, got %v", err)
+			}
+			if outcome != ResumeOutcomeUnknown {
+				t.Errorf("joiner outcome = %q, want %q", outcome, ResumeOutcomeUnknown)
+			}
+
+			close(proceed)
+			res := <-leaderCh
+			if res.err != nil {
+				t.Fatalf("leader: unexpected error: %v", res.err)
+			}
+			if res.outcome != ResumeOutcomeTriggered {
+				t.Errorf("leader outcome = %q, want %q", res.outcome, ResumeOutcomeTriggered)
+			}
+			if res.actor.GetStatus().GetWorkerAssignment().GetWorkerPodIp() != expectedIP {
+				t.Errorf("leader IP = %q, want %q", res.actor.GetStatus().GetWorkerAssignment().GetWorkerPodIp(), expectedIP)
+			}
+			if got := lot.activeCount(); got != 0 {
+				t.Errorf("all slots must be released; active = %d, want 0", got)
+			}
+		})
+	})
+
+	t.Run("BudgetExhaustionReleasesSlot", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			cfg := ParkedRequestConfig{Max: 1, Budget: 1 * time.Second}
+			lot := newParkingLot(cfg, nil)
+			mock := &resumerMockClient{
+				resumeFn: func(
+					ctx context.Context,
+					in *ateapipb.ResumeActorRequest,
+					opts ...grpc.CallOption,
+				) (*ateapipb.ResumeActorResponse, error) {
+					return nil, status.Error(codes.ResourceExhausted, "no free workers available")
+				},
+			}
+
+			resumer := NewActorResumer(mock, withParking(cfg), withParkingLot(lot))
+			_, _, err := resumer.ResumeActor(context.Background(), testActorRef)
+			var budget *budgetExhaustedError
+			if !errors.As(err, &budget) {
+				t.Fatalf("expected budget exhaustion, got %T (%v)", err, err)
+			}
+			if got := status.Code(err); got != codes.ResourceExhausted {
+				t.Errorf("expected the underlying capacity code to surface, got %v", got)
+			}
+			if got := lot.activeCount(); got != 0 {
+				t.Errorf("slot must be released on budget exhaustion; active = %d, want 0", got)
+			}
+		})
+	})
+
+	t.Run("CancelWhileParkedReleasesSlot", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			cfg := ParkedRequestConfig{Max: 1, Budget: 5 * time.Second}
+			lot := newParkingLot(cfg, nil)
+			proceed := make(chan struct{})
+			var mu sync.Mutex
+			var calls int
+			mock := &resumerMockClient{
+				resumeFn: func(
+					ctx context.Context,
+					in *ateapipb.ResumeActorRequest,
+					opts ...grpc.CallOption,
+				) (*ateapipb.ResumeActorResponse, error) {
+					mu.Lock()
+					calls++
+					n := calls
+					mu.Unlock()
+					if n == 1 {
+						return nil, status.Error(codes.ResourceExhausted, "no free workers available")
+					}
+					<-proceed
+					return runningResp(), nil
+				},
+			}
+			resumer := NewActorResumer(mock, withParking(cfg), withParkingLot(lot))
+
+			ctx, cancel := context.WithCancel(context.Background())
+			errCh := make(chan error, 1)
+			go func() {
+				_, _, err := resumer.ResumeActor(ctx, testActorRef)
+				errCh <- err
+			}()
+			synctest.Wait()
+			if got := lot.activeCount(); got != 1 {
+				t.Fatalf("parked caller must hold a slot; active = %d, want 1", got)
+			}
+
+			cancel()
+			if err := <-errCh; !errors.Is(err, context.Canceled) {
+				t.Fatalf("expected context.Canceled, got %v", err)
+			}
+			if got := lot.activeCount(); got != 0 {
+				t.Errorf("slot must be released when the caller disconnects; active = %d, want 0", got)
+			}
+
+			// Let the abandoned flight run out: it wakes from its backoff
+			// (fake time), finds proceed closed, completes, and exits before
+			// the bubble does.
+			close(proceed)
+			time.Sleep(200 * time.Millisecond)
+		})
+	})
+
+	t.Run("CompletedFlightIsForgotten", func(t *testing.T) {
+		var mu sync.Mutex
+		var calls int
+		mock := &resumerMockClient{
+			resumeFn: func(
+				ctx context.Context,
+				in *ateapipb.ResumeActorRequest,
+				opts ...grpc.CallOption,
+			) (*ateapipb.ResumeActorResponse, error) {
+				mu.Lock()
+				calls++
+				mu.Unlock()
+				return runningResp(), nil
+			},
+		}
+		resumer := NewActorResumer(mock, withParking(ParkedRequestConfig{Max: 1, Budget: time.Second}))
+		for i := 0; i < 2; i++ {
+			_, outcome, err := resumer.ResumeActor(context.Background(), testActorRef)
+			if err != nil {
+				t.Fatalf("call %d: unexpected error: %v", i, err)
+			}
+			if outcome != ResumeOutcomeTriggered {
+				t.Errorf("call %d: outcome = %q, want %q (each sequential call starts a fresh flight)", i, outcome, ResumeOutcomeTriggered)
+			}
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if calls != 2 {
+			t.Errorf("sequential calls must not share a completed flight; RPCs = %d, want 2", calls)
+		}
+	})
+}
+
+func TestResumeBackoffHasNoCap(t *testing.T) {
+	// Regression: the resume backoff must NOT set wait.Backoff.Cap. delay() zeroes
+	// Steps the moment the delay reaches Cap, which would end parking retries far
+	// short of the budget (a 2s Cap stops the loop in ~7 steps / ~5s). The budget
+	// context — not the step count or a cap — must bound how long a request parks.
+	b := resumeBackoff(DefaultParkedRequestRetryInterval, DefaultParkedRequestRetryFactor, DefaultParkedRequestRetryJitter)
+	if b.Cap != 0 {
+		t.Errorf("resume backoff must not set Cap (it would stop retries at the cap); got %v", b.Cap)
+	}
+	if b.Steps < 1<<20 {
+		t.Errorf("resume backoff Steps must be high so the budget bounds the wait; got %d", b.Steps)
+	}
+}
+
+// The singleflight flight detaches from the caller's cancellation but must
+// keep the caller's trace identity, or the ateapi call starts a fresh root
+// trace and the server-side resume spans fragment away from the request that
+// triggered them.
+func TestActorResumer_FlightKeepsCallerTraceContext(t *testing.T) {
+	testActorRef := resources.ActorRef{Atespace: "team-a", Name: "actor-trace"}
+
+	want := trace.NewSpanContext(trace.SpanContextConfig{
+		TraceID:    trace.TraceID{0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a},
+		SpanID:     trace.SpanID{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08},
+		TraceFlags: trace.FlagsSampled,
+	})
+
+	var got trace.SpanContext
+	mock := &resumerMockClient{
+		resumeFn: func(ctx context.Context, in *ateapipb.ResumeActorRequest, opts ...grpc.CallOption) (*ateapipb.ResumeActorResponse, error) {
+			got = trace.SpanContextFromContext(ctx)
+			return &ateapipb.ResumeActorResponse{
+				Actor: &ateapipb.Actor{Status: &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_RUNNING, WorkerAssignment: &ateapipb.WorkerAssignment{WorkerPodIp: "10.0.0.1"}}},
+			}, nil
+		},
+	}
+
+	resumer := NewActorResumer(mock)
+	ctx := trace.ContextWithSpanContext(context.Background(), want)
+	if _, _, err := resumer.ResumeActor(ctx, testActorRef); err != nil {
+		t.Fatalf("ResumeActor: %v", err)
+	}
+
+	if got.TraceID() != want.TraceID() {
+		t.Errorf("flight RPC trace ID = %s, want the caller's %s", got.TraceID(), want.TraceID())
+	}
+	if !got.IsSampled() {
+		t.Error("flight RPC lost the caller's sampled flag")
+	}
+}

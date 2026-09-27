@@ -1,0 +1,140 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package controlapi
+
+import (
+	"context"
+	"reflect"
+	"strings"
+
+	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
+	"k8s.io/apimachinery/pkg/api/operation"
+	"k8s.io/apimachinery/pkg/util/validation"
+	"k8s.io/apimachinery/pkg/util/validation/field"
+)
+
+func toGRPCStatusError(errs field.ErrorList) error {
+	return status.Error(codes.InvalidArgument, errs.ToAggregate().Error())
+}
+
+func toGRPCInternalError(errs field.ErrorList) error {
+	return status.Error(codes.Internal, errs.ToAggregate().Error())
+}
+
+// scrubResourceMetadataForCreate removes fields that should not be set by the
+// user when creating a resource.
+func scrubResourceMetadataForCreate(in *ateapipb.ResourceMetadata) {
+	if in == nil {
+		return // validation will flag it
+	}
+	in.Uid = ""         // will be set later
+	in.Version = 0      // will be set later
+	in.CreateTime = nil // will be set later
+	in.UpdateTime = nil // will be set later
+}
+
+// scrubResourceMetadataForUpdate removes fields that should not be set by the
+// user when updating a resource.
+func scrubResourceMetadataForUpdate(in *ateapipb.ResourceMetadata) {
+	if in == nil {
+		return // validation will flag it
+	}
+	// in.Uid and in.Version are preconditions, so we don't scrub them.
+	in.CreateTime = nil // will be set later
+	in.UpdateTime = nil // will be set later
+}
+
+// ateDeepEqual compares two values of any type, using proto.Equal if both are
+// proto messages, and reflect.DeepEqual otherwise.  This is called by
+// declarative validation's generated code.
+func ateDeepEqual[T any](a, b T) bool {
+	asProto := func(x any) proto.Message {
+		pm, ok := x.(proto.Message)
+		if !ok {
+			return nil
+		}
+		return pm
+	}
+
+	if pa, pb := asProto(a), asProto(b); pa != nil && pb != nil {
+		return proto.Equal(pa, pb)
+	}
+	return reflect.DeepEqual(a, b)
+}
+
+// ValidateCustom_ResourceMetadata checks the server-stamped timestamps: each,
+// when set, must be a valid google.protobuf.Timestamp, and update_time must
+// not precede create_time. Both fields are scrubbed from input, so a
+// violation here is a server stamping bug surfaced by the final-object
+// validation pass, not a client error.
+func ValidateCustom_ResourceMetadata(_ context.Context, _ operation.Operation, fldPath *field.Path, obj, _ *ateapipb.ResourceMetadata) field.ErrorList {
+	var errs field.ErrorList
+	createTimeValid := false
+	if ct := obj.GetCreateTime(); ct != nil {
+		if err := ct.CheckValid(); err != nil {
+			errs = append(errs, field.Invalid(fldPath.Child("create_time"), ct.String(), err.Error()))
+		} else {
+			createTimeValid = true
+		}
+	}
+	if ut := obj.GetUpdateTime(); ut != nil {
+		if err := ut.CheckValid(); err != nil {
+			errs = append(errs, field.Invalid(fldPath.Child("update_time"), ut.String(), err.Error()))
+		} else if createTimeValid && ut.AsTime().Before(obj.GetCreateTime().AsTime()) {
+			errs = append(errs, field.Invalid(fldPath.Child("update_time"), ut.String(), "must not precede create_time"))
+		}
+	}
+	return errs
+}
+
+// This is needed because DV doesn't have a standard format for IP addresses yet.
+func ValidateCustom_WorkerAssignment_WorkerPodIp(_ context.Context, _ operation.Operation, fldPath *field.Path, value, _ *string) field.ErrorList {
+	return validation.IsValidIP(fldPath, *value)
+}
+
+// ValidateCustom_ExternalVolume_VolumeType checks that a volume type string is well-formed.
+// It allows an optional "substrate.io/" prefix, followed by a valid DNS-1123 subdomain.
+func ValidateCustom_ExternalVolume_VolumeType(_ context.Context, _ operation.Operation, fldPath *field.Path, value, _ *string) field.ErrorList {
+	if value == nil || *value == "" {
+		return nil
+	}
+	var errs field.ErrorList
+	valToValidate := strings.TrimPrefix(*value, "substrate.io/")
+	for _, msg := range validation.IsDNS1123Subdomain(valToValidate) {
+		errs = append(errs, field.Invalid(fldPath, *value, msg))
+	}
+	return errs
+}
+
+// ValidateCustom_ExternalVolume_StorageVolumeId checks that an external volume's storage ID does not
+// contain control characters (U+0000-U+0008, U+000B, U+000C, U+000E-U+001F, U+007F-U+009F).
+func ValidateCustom_ExternalVolume_StorageVolumeId(_ context.Context, _ operation.Operation, fldPath *field.Path, value, _ *string) field.ErrorList {
+	if value == nil || *value == "" {
+		return nil
+	}
+	for _, r := range *value {
+		if (r >= 0x0000 && r <= 0x0008) ||
+			r == 0x000B ||
+			r == 0x000C ||
+			(r >= 0x000E && r <= 0x001F) ||
+			(r >= 0x007F && r <= 0x009F) {
+			return field.ErrorList{field.Invalid(fldPath, *value, "must not contain control characters (U+0000-U+0008, U+000B, U+000C, U+000E-U+001F, U+007F-U+009F)")}
+		}
+	}
+	return nil
+}

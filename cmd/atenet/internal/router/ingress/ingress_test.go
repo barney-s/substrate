@@ -1,0 +1,505 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package ingress
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"log/slog"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"testing/synctest"
+	"time"
+
+	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+	envoy_type "github.com/envoyproxy/go-control-plane/envoy/type/v3"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/structpb"
+
+	"github.com/agent-substrate/substrate/cmd/atenet/internal/router/extproc"
+	"github.com/agent-substrate/substrate/internal/atenet"
+	"github.com/agent-substrate/substrate/internal/atunnel"
+	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+)
+
+type mockClient struct {
+	ateapipb.ControlClient
+	resumeFn func(ctx context.Context, in *ateapipb.ResumeActorRequest, opts ...grpc.CallOption) (*ateapipb.ResumeActorResponse, error)
+}
+
+func (m *mockClient) ResumeActor(ctx context.Context, in *ateapipb.ResumeActorRequest, opts ...grpc.CallOption) (*ateapipb.ResumeActorResponse, error) {
+	return m.resumeFn(ctx, in, opts...)
+}
+
+func requestMetadata(actorName, atespace string, headers ...*corev3.HeaderValue) *extproc.RequestMetadata {
+	headers = append(headers,
+		&corev3.HeaderValue{Key: atenet.TargetActorHeader, Value: atespace + "/" + actorName},
+	)
+	return extproc.NewRequestMetadata(headers, nil)
+}
+
+func TestHandleRequestHeadersAcceptsMixedCaseRoutingHeaders(t *testing.T) {
+	clientMock := &mockClient{
+		resumeFn: func(_ context.Context, in *ateapipb.ResumeActorRequest, _ ...grpc.CallOption) (*ateapipb.ResumeActorResponse, error) {
+			if got, want := in.GetActor().GetName(), "actor-1"; got != want {
+				t.Errorf("actor name = %q, want %q", got, want)
+			}
+			if got, want := in.GetActor().GetAtespace(), "team-a"; got != want {
+				t.Errorf("atespace = %q, want %q", got, want)
+			}
+			return &ateapipb.ResumeActorResponse{Actor: &ateapipb.Actor{
+				Status: &ateapipb.ActorStatus{WorkerAssignment: &ateapipb.WorkerAssignment{WorkerPodIp: "10.0.0.52"}},
+			}}, nil
+		},
+	}
+	h := New(clientMock, ParkedRequestConfig{}, nil)
+	md := extproc.NewRequestMetadata([]*corev3.HeaderValue{
+		{Key: "ate-target-actor", Value: "team-a/actor-1"},
+	}, nil)
+
+	if _, err := h.HandleRequestHeaders(context.Background(), md); err != nil {
+		t.Fatalf("HandleRequestHeaders() error = %v", err)
+	}
+}
+
+// dynamicMetadataTarget extracts the resolved worker address
+// HandleRequestHeaders reports via OriginalDstMetadataKey/OriginalDstAddressKey.
+func dynamicMetadataTarget(dynamicMetadata *structpb.Struct) string {
+	return dynamicMetadata.GetFields()[OriginalDstMetadataKey].GetStructValue().GetFields()[OriginalDstAddressKey].GetStringValue()
+}
+
+// dynamicMetadataPort extracts the target port HandleRequestHeaders reports
+// via OriginalDstMetadataKey/OriginalDstPortKey.
+func dynamicMetadataPort(dynamicMetadata *structpb.Struct) string {
+	return dynamicMetadata.GetFields()[OriginalDstMetadataKey].GetStructValue().GetFields()[OriginalDstPortKey].GetStringValue()
+}
+
+func TestHandleRequestHeadersDoesNotLogSensitiveData(t *testing.T) {
+	const testUUID = "123e4567-e89b-12d3-a456-426614174000"
+	const secret = "do-not-log-me"
+	authority := testUUID + ".team-a.actors.resources.substrate.ate.dev"
+
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	h := New(&mockClient{
+		resumeFn: func(ctx context.Context, in *ateapipb.ResumeActorRequest, opts ...grpc.CallOption) (*ateapipb.ResumeActorResponse, error) {
+			return &ateapipb.ResumeActorResponse{Actor: &ateapipb.Actor{Status: &ateapipb.ActorStatus{WorkerAssignment: &ateapipb.WorkerAssignment{WorkerPodIp: "10.0.0.52"}}}}, nil
+		},
+	}, ParkedRequestConfig{}, nil)
+
+	md := requestMetadata(testUUID, "team-a",
+		&corev3.HeaderValue{Key: ":path", Value: "/api/v1/reset?token=" + secret},
+		&corev3.HeaderValue{Key: ":authority", Value: authority},
+		&corev3.HeaderValue{Key: ":method", Value: "POST"},
+		&corev3.HeaderValue{Key: "authorization", Value: "Bearer " + secret},
+		&corev3.HeaderValue{Key: "cookie", Value: "session=" + secret},
+	)
+
+	res, err := h.HandleRequestHeaders(context.Background(), md)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	out := buf.String()
+	if strings.Contains(out, secret) {
+		t.Errorf("router log leaked sensitive value: %s", out)
+	}
+	if !strings.Contains(out, testUUID) {
+		t.Errorf("router log missing actor/host routing context: %s", out)
+	}
+
+	// The mux records every handled request on the status page; the metadata the
+	// handler was given must not carry the secret into it either.
+	rec := extproc.NewQueryRecorder(10)
+	rec.AddRouterRequest(time.Now(), time.Millisecond, "Route ok", res.Target, md)
+	for _, q := range rec.Get() {
+		if blob, _ := json.Marshal(q); strings.Contains(string(blob), secret) {
+			t.Errorf("recorder/statusz retained sensitive value: %s", blob)
+		}
+	}
+}
+
+func TestHandleRequestHeaders(t *testing.T) {
+	const testUUID = "123e4567-e89b-12d3-a456-426614174000"
+
+	tests := []struct {
+		name               string
+		actorName          string
+		atespace           string
+		authority          string
+		resumeResp         *ateapipb.ResumeActorResponse
+		resumeErr          error
+		expectErr          bool
+		expectedErrStr     string
+		expectedStatus     envoy_type.StatusCode
+		expectedTarget     string
+		expectedTargetPort string
+	}{
+		{
+			name:           "invalid actor header returns 404",
+			actorName:      "INVALID",
+			atespace:       "team-a",
+			authority:      "invalid-host.com",
+			expectErr:      true,
+			expectedErrStr: `invalid actor reference`,
+			expectedStatus: envoy_type.StatusCode_NotFound,
+		},
+		{
+			name:           "non-gRPC resume error collapses to 500 without leaking detail",
+			authority:      testUUID + ".team-a.actors.resources.substrate.ate.dev",
+			resumeErr:      errors.New("resume failed with sensitive detail"),
+			expectErr:      true,
+			expectedErrStr: `error resuming actor team-a/123e4567-e89b-12d3-a456-426614174000`,
+			expectedStatus: envoy_type.StatusCode_InternalServerError,
+		},
+		{
+			name:           "FailedPrecondition maps to 503 with preserved desc",
+			authority:      testUUID + ".team-a.actors.resources.substrate.ate.dev",
+			resumeErr:      status.Error(codes.FailedPrecondition, "no free workers available"),
+			expectErr:      true,
+			expectedErrStr: `actor team-a/123e4567-e89b-12d3-a456-426614174000 unavailable: no free workers available`,
+			expectedStatus: envoy_type.StatusCode_ServiceUnavailable,
+		},
+		{
+			name:           "NotFound maps to 404",
+			authority:      testUUID + ".team-a.actors.resources.substrate.ate.dev",
+			resumeErr:      status.Error(codes.NotFound, "actor missing"),
+			expectErr:      true,
+			expectedErrStr: `actor team-a/123e4567-e89b-12d3-a456-426614174000 not found`,
+			expectedStatus: envoy_type.StatusCode_NotFound,
+		},
+		{
+			name:           "Unavailable maps to 503",
+			authority:      testUUID + ".team-a.actors.resources.substrate.ate.dev",
+			resumeErr:      status.Error(codes.Unavailable, "control-plane down"),
+			expectErr:      true,
+			expectedErrStr: `actor team-a/123e4567-e89b-12d3-a456-426614174000 unavailable`,
+			expectedStatus: envoy_type.StatusCode_ServiceUnavailable,
+		},
+		{
+			name:           "DeadlineExceeded maps to 504",
+			authority:      testUUID + ".team-a.actors.resources.substrate.ate.dev",
+			resumeErr:      status.Error(codes.DeadlineExceeded, "deadline"),
+			expectErr:      true,
+			expectedErrStr: `actor team-a/123e4567-e89b-12d3-a456-426614174000 request timed out`,
+			expectedStatus: envoy_type.StatusCode_GatewayTimeout,
+		},
+		{
+			name:      "Bad Actor IP from resume returns 500 without leaking IP",
+			authority: testUUID + ".team-a.actors.resources.substrate.ate.dev",
+			resumeResp: &ateapipb.ResumeActorResponse{
+				Actor: &ateapipb.Actor{
+					Status: &ateapipb.ActorStatus{WorkerAssignment: &ateapipb.WorkerAssignment{WorkerPodIp: "invalid-ip"}},
+				},
+			},
+			expectErr:      true,
+			expectedErrStr: `actor team-a/123e4567-e89b-12d3-a456-426614174000 routing failed`,
+			expectedStatus: envoy_type.StatusCode_InternalServerError,
+		},
+		{
+			name:      "successful resume ignores host and port for actor routing",
+			authority: "127.0.0.1:44681",
+			resumeResp: &ateapipb.ResumeActorResponse{
+				Actor: &ateapipb.Actor{
+					Status: &ateapipb.ActorStatus{WorkerAssignment: &ateapipb.WorkerAssignment{WorkerPodIp: "10.0.0.52"}},
+				},
+			},
+			expectErr:          false,
+			expectedTarget:     "10.0.0.52:443",
+			expectedTargetPort: "80",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			actorName := tc.actorName
+			if actorName == "" {
+				actorName = testUUID
+			}
+			atespace := tc.atespace
+			if atespace == "" {
+				atespace = "team-a"
+			}
+			clientMock := &mockClient{
+				resumeFn: func(ctx context.Context, in *ateapipb.ResumeActorRequest, opts ...grpc.CallOption) (*ateapipb.ResumeActorResponse, error) {
+					if in.GetActor().GetName() != testUUID {
+						t.Errorf("unexpected identifier parsed in test context: %s", in.GetActor().GetName())
+					}
+					if tc.resumeErr != nil {
+						return nil, tc.resumeErr
+					}
+					return tc.resumeResp, nil
+				},
+			}
+
+			// Parking disabled: these cases assert fail-fast mapping of resume
+			// errors (e.g. FailedPrecondition -> immediate 503). Parking behavior
+			// is covered separately in TestHandleRequestHeaders_ParkingLotFull and
+			// resumer_test.go.
+			h := New(clientMock, ParkedRequestConfig{}, nil)
+
+			md := requestMetadata(actorName, atespace,
+				&corev3.HeaderValue{Key: ":path", Value: "/v1/actors/invoke"},
+				&corev3.HeaderValue{Key: ":authority", Value: tc.authority},
+				&corev3.HeaderValue{Key: ":method", Value: "POST"},
+			)
+
+			res, err := h.HandleRequestHeaders(context.Background(), md)
+			if tc.expectErr {
+				if err == nil {
+					t.Fatalf("expected error but got nil")
+				}
+				if tc.expectedErrStr != "" && err.Error() != tc.expectedErrStr {
+					t.Errorf("client body mismatch:\n  got:  %q\n  want: %q", err.Error(), tc.expectedErrStr)
+				}
+				var reqErr *extproc.ReqError
+				if !errors.As(err, &reqErr) {
+					t.Fatalf("expected *extproc.ReqError, got %T (%v)", err, err)
+				}
+				if got, want := reqErr.StatusCode, int(tc.expectedStatus); got != want {
+					t.Errorf("HTTP status code = %d, want %d", got, want)
+				}
+				if tc.resumeErr != nil && !errors.Is(err, tc.resumeErr) {
+					t.Errorf("original resume error must be preserved in chain for logs; errors.Is(err, resumeErr) = false")
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("ext_proc processing error: %v", err)
+			}
+			if res.Target != tc.expectedTarget {
+				t.Errorf("expected target %q, got %q", tc.expectedTarget, res.Target)
+			}
+
+			mutation := res.Response.GetResponse().GetHeaderMutation()
+			if len(mutation.GetSetHeaders()) != 1 {
+				t.Fatalf("expected actor routing header, found: %v", mutation.GetSetHeaders())
+			}
+
+			gotMutations := map[string]string{}
+			for _, headerOption := range mutation.GetSetHeaders() {
+				gotMutations[strings.ToLower(headerOption.Header.Key)] = string(headerOption.Header.RawValue)
+			}
+			if _, ok := gotMutations[strings.ToLower(atunnel.TargetPortHeader)]; ok {
+				t.Errorf("target port must be emitted only as dynamic metadata")
+			}
+			if got, want := gotMutations[strings.ToLower(atenet.TargetActorHeader)], "team-a/"+testUUID; got != want {
+				t.Errorf("actor target mutation = %q, want %q", got, want)
+			}
+			if got := dynamicMetadataTarget(res.DynamicMetadata); got != tc.expectedTarget {
+				t.Errorf("invalid destination mapping found: %s, expected: %s", got, tc.expectedTarget)
+			}
+			if got := dynamicMetadataPort(res.DynamicMetadata); got != tc.expectedTargetPort {
+				t.Errorf("dynamic metadata port = %q, want %q", got, tc.expectedTargetPort)
+			}
+		})
+	}
+}
+
+// TestHandleRequestHeadersHandlesConnectMethod locks in that a CONNECT request
+// (used for atenet-router's arbitrary-port ingress support -- the target port
+// travels in :authority, e.g. "<actor-dns>:9090") resolves the actor,
+// produces the same "<workerIP>:443" original-dst mutation as an ordinary
+// request (the router only ever dials the worker's atunnel server), and
+// reports the arbitrary port itself in dynamic metadata for Envoy to write to
+// atunnel.TargetPortHeader.
+func TestHandleRequestHeadersHandlesConnectMethod(t *testing.T) {
+	const testUUID = "123e4567-e89b-12d3-a456-426614174000"
+	authority := testUUID + ".team-a.actors.resources.substrate.ate.dev:9090"
+
+	clientMock := &mockClient{
+		resumeFn: func(ctx context.Context, in *ateapipb.ResumeActorRequest, opts ...grpc.CallOption) (*ateapipb.ResumeActorResponse, error) {
+			return &ateapipb.ResumeActorResponse{Actor: &ateapipb.Actor{Status: &ateapipb.ActorStatus{WorkerAssignment: &ateapipb.WorkerAssignment{WorkerPodIp: "10.0.0.52"}}}}, nil
+		},
+	}
+	h := New(clientMock, ParkedRequestConfig{}, nil)
+
+	// CONNECT requests carry no :path; the request-target lives in :authority.
+	md := requestMetadata(testUUID, "team-a",
+		&corev3.HeaderValue{Key: ":authority", Value: authority},
+		&corev3.HeaderValue{Key: ":method", Value: "CONNECT"},
+	)
+
+	res, err := h.HandleRequestHeaders(context.Background(), md)
+	if err != nil {
+		t.Fatalf("ext_proc processing error for CONNECT: %v", err)
+	}
+
+	const wantTarget = "10.0.0.52:443"
+	if res.Target != wantTarget {
+		t.Errorf("target = %q, want %q", res.Target, wantTarget)
+	}
+	if got := dynamicMetadataTarget(res.DynamicMetadata); got != wantTarget {
+		t.Errorf("invalid destination mapping found: %s, expected: %s", got, wantTarget)
+	}
+	if got := dynamicMetadataPort(res.DynamicMetadata); got != "9090" {
+		t.Errorf("dynamic metadata port = %q, want %q", got, "9090")
+	}
+}
+
+func TestHandleRequestHeadersUsesRetainedConnectAuthorityForPort(t *testing.T) {
+	const testUUID = "123e4567-e89b-12d3-a456-426614174000"
+	clientMock := &mockClient{
+		resumeFn: func(context.Context, *ateapipb.ResumeActorRequest, ...grpc.CallOption) (*ateapipb.ResumeActorResponse, error) {
+			return &ateapipb.ResumeActorResponse{Actor: &ateapipb.Actor{
+				Status: &ateapipb.ActorStatus{WorkerAssignment: &ateapipb.WorkerAssignment{WorkerPodIp: "10.0.0.52"}},
+			}}, nil
+		},
+	}
+	attrs := map[string]*structpb.Struct{
+		"envoy.filters.http.ext_proc": {
+			Fields: map[string]*structpb.Value{
+				extproc.ConnectAuthorityFilterStateAttribute: structpb.NewStringValue("unrelated.example:9090"),
+			},
+		},
+	}
+	md := extproc.NewRequestMetadata([]*corev3.HeaderValue{
+		{Key: atenet.TargetActorHeader, Value: "team-a/" + testUUID},
+		{Key: ":authority", Value: "inner.example"},
+	}, attrs)
+
+	res, err := New(clientMock, ParkedRequestConfig{}, nil).HandleRequestHeaders(context.Background(), md)
+	if err != nil {
+		t.Fatalf("HandleRequestHeaders() error = %v", err)
+	}
+	if got, want := dynamicMetadataPort(res.DynamicMetadata), "9090"; got != want {
+		t.Errorf("target port = %q, want %q", got, want)
+	}
+}
+
+// TestHandleRequestHeaders_FullLotServesRunningActor pins the design guarantee
+// from docs/request-parking.md: a saturated parking lot cannot starve requests
+// to already-running actors, at any lot size. A request whose resume resolves
+// on the first attempt never occupies a slot, so it is served even with the
+// lot at capacity (issue #1081).
+func TestHandleRequestHeaders_FullLotServesRunningActor(t *testing.T) {
+	const testUUID = "123e4567-e89b-12d3-a456-426614174000"
+	authority := testUUID + ".team-a.actors.resources.substrate.ate.dev"
+
+	var resumeCalled bool
+	clientMock := &mockClient{
+		resumeFn: func(
+			ctx context.Context,
+			in *ateapipb.ResumeActorRequest,
+			opts ...grpc.CallOption,
+		) (*ateapipb.ResumeActorResponse, error) {
+			resumeCalled = true
+			return &ateapipb.ResumeActorResponse{
+				Actor: &ateapipb.Actor{
+					Status: &ateapipb.ActorStatus{
+						State:            ateapipb.ActorState_ACTOR_STATE_RUNNING,
+						WorkerAssignment: &ateapipb.WorkerAssignment{WorkerPodIp: "10.0.0.1"},
+					},
+				},
+			}, nil
+		},
+	}
+
+	// A 1-slot lot with the slot already occupied deterministically simulates a
+	// full lot without needing a concurrent in-flight request.
+	h := New(clientMock, ParkedRequestConfig{Budget: time.Second, Max: 1}, nil)
+	release, ok := h.parking.enter(context.Background())
+	if !ok {
+		t.Fatal("priming enter should be admitted")
+	}
+	defer release(parkOutcomeServed)
+
+	md := requestMetadata(testUUID, "team-a",
+		&corev3.HeaderValue{Key: ":authority", Value: authority},
+	)
+
+	res, err := h.HandleRequestHeaders(context.Background(), md)
+	if err != nil {
+		t.Fatalf("a running actor must be served despite a full lot, got: %v", err)
+	}
+	if !resumeCalled {
+		t.Error("the resume lookup must still run when the lot is full")
+	}
+	const wantTarget = "10.0.0.1:443"
+	if res.Target != wantTarget {
+		t.Errorf("target = %q, want %q", res.Target, wantTarget)
+	}
+	if got := h.parking.activeCount(); got != 1 {
+		t.Errorf("a first-attempt resolution must not occupy a slot; active = %d, want 1 (the priming entry)", got)
+	}
+}
+
+// TestHandleRequestHeaders_FullLotShedsParkedRequest verifies the other half
+// of lot admission: when the lot is full, a request whose resume actually
+// parks (first retryable failure) is shed with 503 "router at capacity" — at
+// the park transition, after its single initial attempt, not before any.
+func TestHandleRequestHeaders_FullLotShedsParkedRequest(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const testUUID = "123e4567-e89b-12d3-a456-426614174000"
+		authority := testUUID + ".team-a.actors.resources.substrate.ate.dev"
+
+		var resumeCalls atomic.Int32
+		clientMock := &mockClient{
+			resumeFn: func(
+				ctx context.Context,
+				in *ateapipb.ResumeActorRequest,
+				opts ...grpc.CallOption,
+			) (*ateapipb.ResumeActorResponse, error) {
+				resumeCalls.Add(1)
+				return nil, status.Error(codes.ResourceExhausted, "no free workers available")
+			},
+		}
+
+		h := New(clientMock, ParkedRequestConfig{Budget: 500 * time.Millisecond, Max: 1}, nil)
+		release, ok := h.parking.enter(context.Background())
+		if !ok {
+			t.Fatal("priming enter should be admitted")
+		}
+		defer release(parkOutcomeServed)
+
+		md := requestMetadata(testUUID, "team-a",
+			&corev3.HeaderValue{Key: ":authority", Value: authority},
+		)
+
+		_, err := h.HandleRequestHeaders(context.Background(), md)
+		if err == nil {
+			t.Fatal("expected error when a parked request finds the lot full")
+		}
+		var reqErr *extproc.ReqError
+		if !errors.As(err, &reqErr) {
+			t.Fatalf("expected *extproc.ReqError, got %T (%v)", err, err)
+		}
+		if reqErr.StatusCode != int(envoy_type.StatusCode_ServiceUnavailable) {
+			t.Errorf("status code = %d, want %d (503)", reqErr.StatusCode, envoy_type.StatusCode_ServiceUnavailable)
+		}
+		if !strings.Contains(reqErr.Error(), "router at capacity") {
+			t.Errorf("error body = %q, want it to mention capacity", reqErr.Error())
+		}
+		// Shedding happens at the park transition: exactly one attempt has run
+		// when the caller is turned away.
+		if got := resumeCalls.Load(); got != 1 {
+			t.Errorf("expected the caller shed after exactly 1 attempt, got %d", got)
+		}
+
+		// The abandoned flight retries on until its budget, like any flight
+		// whose callers left; sleep (fake time) past the budget so it exits
+		// before the bubble does.
+		time.Sleep(600 * time.Millisecond)
+	})
+}
