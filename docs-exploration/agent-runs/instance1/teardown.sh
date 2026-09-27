@@ -29,14 +29,17 @@ export GOCACHE=/tmp/gocache
 export GOTMPDIR=/tmp/gotmp
 mkdir -p "${GOCACHE}" "${GOTMPDIR}"
 
-# 1. Remove the control plane and demos (drops postgres PVC and backing PD)
-hack/install-ate.sh --delete-all
+# 1. Remove the control plane and demos (drops postgres PVC and backing PD) if cluster exists
+if gcloud container clusters describe "${CLUSTER_NAME}" --location="${CLUSTER_LOCATION}" --project="${PROJECT_ID}" >/dev/null 2>&1; then
+  hack/install-ate.sh --delete-all || true
+fi
 
 # 2. Delete bucket IAM policy bindings, snapshot bucket, and cluster
 hack/teardown.sh --delete-iam-policy-bindings --delete-snapshot-bucket --delete-cluster
 
 # 3. Clean up container images pushed for this instance
-for img in $(gcloud artifacts docker images list "${KO_DOCKER_REPO}" --format='value(package)' 2>/dev/null | sort -u); do
+GAR_REPO="us-docker.pkg.dev/${PROJECT_ID}/gcr.io/${RESOURCE_PREFIX}"
+for img in $(gcloud artifacts docker images list "${GAR_REPO}" --format='value(package)' 2>/dev/null | sort -u); do
   gcloud artifacts docker images delete "${img}" --delete-tags --quiet || true
 done
 
