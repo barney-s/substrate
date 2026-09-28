@@ -1,15 +1,16 @@
-# Substrate Changes and Evolution (September 13 – September 27, 2026)
+# Substrate Changes and Evolution (September 13 – September 28, 2026)
 
-This document records the major changes, architectural shifts, churn distribution, breaking interface modifications, and open follow-up tasks in the [Substrate](https://github.com/agent-substrate/substrate) repository over the two-week window from September 13, 2026 to September 27, 2026.
+This document records the major changes, architectural shifts, churn distribution, breaking interface modifications, and open follow-up tasks in the [Substrate](https://github.com/agent-substrate/substrate) repository over the two-week window from September 13, 2026 to September 28, 2026. It serves as a self-contained catch-up briefing covering what was investigated, what landed in git history, and what remains actively unresolved.
 
 ---
 
 ## 1. Scope, Methodology, and Release Milestones
 
-* **Window Covered:** September 13, 2026 22:35 UTC through September 27, 2026 00:00 UTC.
-* **Commit Range:** `67253354..ed6d2a1f` (138 non-merge commits on `main` following commit `67253354`).
+* **Window Covered:** September 13, 2026 22:35 UTC through September 28, 2026 18:30 UTC.
+* **Commit Range:** `67253354..c7dbe9d6` (142 non-merge commits on `main` following commit `67253354`).
+* **Branch State:** Local `main` fast-forwarded to `origin/main` via `git merge --ff-only origin/main`.
 * **Tag & Release Branch:** Release tag `v0.2.0` was cut on commit `10a1bfb2` (September 25, 2026), creating branch `release-0.2`.
-* **Investigation Note:** The GitHub CLI (`gh`) was unauthenticated in this environment; all analysis, pull request references, issue connections, and architectural diffs were traced directly from git history, commit metadata, code diffs, and in-repo test fixtures.
+* **Investigation Note:** The GitHub CLI (`gh`) was unauthenticated in this environment (`gh auth status` returned exit code 1); all analysis, pull request references, issue connections, and architectural diffs were traced directly from git history, commit metadata, code diffs, and in-repo test fixtures.
 
 ---
 
@@ -19,7 +20,7 @@ This document records the major changes, architectural shifts, churn distributio
 Substrate previously operated on a 1:1 worker-to-actor allocation model: a worker pod ran a single actor sandbox at any given time. During this two-week window, Substrate landed multi-actor concurrency on worker nodes. A single worker pod (running `atelet` and `ateom`) now concurrently hosts multiple independent actor sandboxes. This required dedicated per-sandbox Linux network namespaces, per-actor veth interfaces, local loopback and DNS relays, per-actor cgroup slices keyed by actor UID, and a separation of directory structures passed over RPC via `ActorDirs`.
 
 ### B. Egress Security, Credential Brokering, and Dataplane Hardening
-Outbound traffic from actor sandboxes transitioned from an uninspected bypass to a strictly evaluated multi-leg pipeline governed by `EgressPolicy`. The data plane (`atenet` Envoy proxy + external processing) now intercepts traffic across outer mTLS CONNECT tunnels, cleartext HTTP, and decrypted TLS MITM legs (via `sdsmint`). Matching rules can inject platform-brokered credentials (such as API keys stored in Kubernetes Secrets) without ever revealing the secrets to guest code. Unintercepted UDP egress was blocked for all destination ports except 53, closing covert QUIC/HTTP-3 bypasses. An experimental Envoy dynamic module written in Rust was introduced for in-process policy evaluation.
+Outbound traffic from actor sandboxes transitioned from an uninspected bypass to a strictly evaluated multi-leg pipeline governed by `EgressPolicy`. Prior to GA, `EgressRule` was redesigned as a union of protocols (`http`, `https`, and `tls_passthrough`), replacing legacy `hostnames`/`cidrs`/`all` rules. The data plane (`atenet` Envoy proxy + external processing) now intercepts traffic across outer mTLS CONNECT tunnels, cleartext HTTP, and decrypted TLS MITM legs (via `sdsmint`). Matching rules can inject or replace platform-brokered credentials (such as API keys stored in Kubernetes Secrets) without ever revealing the secrets to guest code. Unintercepted UDP egress was blocked for all destination ports except 53, closing covert QUIC/HTTP-3 bypasses. An experimental Envoy dynamic module written in Rust was introduced for in-process policy evaluation.
 
 ### C. Resilient Lifecycle Recovery (`RevertActor`) and Crash Semantics
 Previously, an actor transitioning to the `CRASHED` state was in a terminal state that could only be deleted. This window introduced the `RevertActor` lifecycle RPC, allowing actors in `RUNNING`, `PAUSED`, or `CRASHED` states to safely discard corrupted execution state, cancel partial in-progress snapshots, and roll back to `SUSPENDED` at their last valid external snapshot. Concurrently, the legacy `ateerrors` taxonomy was deleted in favor of explicit fail-fast crash semantics, logging failure causes directly onto `ActorStatus`.
@@ -88,7 +89,7 @@ graph TD
         MITM -.-> PolicyEngine
         
         CredInject["Credential Injector<br/>(k8s-secrets provider)"]
-        MITM -->|"inject_static_headers"| CredInject
+        MITM -->|"replace_headers"| CredInject
     end
 
     CredInject -->|"Outbound Request with Injected Auth Header"| ExternalAPI["External Services<br/>(e.g., api.openai.com)"]
@@ -99,12 +100,12 @@ graph TD
 ## 4. Notable Changes
 
 ### 1. Multi-Actor Worker Support & Per-Sandbox Networking
-* **Commits:** `14c0c136` (PR #1836), `cd102f0a` (PR #1689), `a0b680d7` (PR #1730)
+* **Commits:** `14c0c136` (PR #1836), `cd102f0a` (PR #1689), `a0b680d7` (PR #1730), `22efea18` (PR #1897), `7999d6f1` (PR #1885)
 * **Details:**
   - Workers support concurrent actor sandboxes. In `internal/ateomnet/sandbox.go:29`, each actor is allocated an isolated network namespace with a unique veth pair and loopback interface.
-  - Dedicated local DNS forwarders run inside `internal/ateomnet/dns.go` and `internal/atunnel/dns.go`, proxying UDP and TCP DNS queries to host cluster resolvers while preventing DNS poisoning across sandboxes.
+  - In PR #1897, network namespace handling and DNS forwarders were split cleanly into `internal/ateomnet/netns` (`netns.go`, `dial.go`, `sysctl.go`) and `internal/ateomnet/dns` (`serve.go`, `resolvconf.go`).
+  - In PR #1885, `atelet` telemetry pinned the multi-actor sweep fold, resolving three CPU-accounting defects (undercount on pending sweeps, overcount during sweep-spanning restores, and guest-agent decrease baseline handling).
   - `ActorDirs` (`internal/proto/ateompb/ateom.proto:113-128`) decouples directory derivation between `atelet` and `ateom`, splitting paths into `cmd/atelet/internal/ateletpath` and `internal/nodepath`.
-  - In `cmd/ateom-gvisor/internal/cgroupstats` and `internal/ateomcgroup/actor.go`, cgroup resource accounting is partitioned under per-actor UID leaf nodes.
 
 ### 2. Cryptographic Split Between Actor and Ateom Identities
 * **Commits:** `8ea4abe1` (PR #1626), `8d6be5fb` (PR #1809), `7f7a40c1` (PR #1810), `ed6d2a1f` (PR #1923)
@@ -115,12 +116,13 @@ graph TD
   - `pkg/proto/ateapipb/ateapi.proto:2051` introduces `rpc MintAteomActorCertificate`.
   - In `cmd/ateapi/internal/authz/model.fga:87-95`, OpenFGA enforces **Node Restriction**: only the specific Kubernetes node hosting the scheduled worker pod (`can_mint_ateom_actor_credential: host_node`) may mint ateom credentials. System tunnels like `atunnel` use this certificate to communicate with `atenet` on behalf of the actor, preventing guest code from impersonating control plane infrastructure.
 
-### 3. EgressPolicy Enforcement and Credential Injection
-* **Commits:** `85ce8ed5` (PR #1360), `57234a86` (PR #1335), `30e6d33d` (PR #1535), `514e6109` (PR #1659), `d7d70420` (PR #1813), `e517df95`, `f980a57d`, `58624ee8`
+### 3. GA EgressPolicy Redesign and Credential Injection
+* **Commits:** `6621f2b4` (PR #1751), `85ce8ed5` (PR #1360), `57234a86` (PR #1335), `30e6d33d` (PR #1535), `514e6109` (PR #1659), `d7d70420` (PR #1813), `58624ee8`
 * **Details:**
-  - `internal/egresspolicy/egresspolicy.go:27-50` implements pure policy evaluation against normalized hostnames and CIDRs.
+  - **Breaking GA Overhaul (PR #1751):** `EgressRule` was refactored into a union of protocols (`http`, `https`, and `tls_passthrough`). The legacy `hostnames`, `cidrs`, and `all` rule categories were removed without reserved fields. Rules form an unordered set resolved by strict specificity precedence (non-wildcard over wildcard, specific port over `*`).
+  - `inject_static_headers` was renamed to `replace_headers`, which conditionally substitutes placeholder headers present in the actor request.
   - `cmd/atenet/internal/router/egress/request.go:34-50` enforces rules across three filter chain legs: outer CONNECT, cleartext HTTP, and decrypted TLS MITM.
-  - When a matched rule specifies `inject_static_headers`, `cmd/credential-provider/kubernetes-secrets/` fetches credentials from Kubernetes secrets and injects them upstream.
+  - When a matched rule specifies `replace_headers`, `cmd/credential-provider/kubernetes-secrets/` fetches credentials from Kubernetes secrets and injects them upstream.
   - `58624ee8` drops actor UDP egress to all ports except 53 via nftables forward chains, blocking QUIC/HTTP-3 bypasses of the TLS MITM proxy.
   - `30e6d33d` introduced an experimental Envoy Dynamic Module in Rust (`cmd/dataplane/envoy/dynamic-modules/egress-policy/src/lib.rs`).
 
@@ -139,14 +141,20 @@ graph TD
   - Tables are created and versioned via Goose migrations (`cmd/ateapi/internal/store/atepg/migrations/000002_openfga.sql`).
   - OpenFGA datastore operations reuse the application's PostgreSQL connection pool (`pgxpool.Pool`) and caller database transactions (`pgx.Tx`), preventing dual-write inconsistencies.
 
-### 6. Pruned Shell Scripts in Favor of `ate-setup` Go Tooling
+### 6. Node State Root Moved to `/var/lib/ate`
+* **Commits:** `c7dbe9d6` (PR #1926)
+* **Details:**
+  - The node state root was previously `/var/lib/ateom-gvisor`. Because both gVisor and microVM sandboxes now execute on worker nodes, `nodepath.BasePath` was moved to `/var/lib/ate`.
+  - Updated across `manifests/ate-install/atelet.yaml`, CSI kind setup scripts, docs, and `ate-setup`.
+
+### 7. Pruned Shell Scripts in Favor of `ate-setup` Go Tooling
 * **Commits:** `6c70d60c` (PR #1785), `d6d2a0fa` (PR #1632), `5ebccf38` (PR #1869)
 * **Details:**
   - Eight `hack/install-demo-*.sh` scripts were deleted.
   - `hack/install-ate.sh` dropped 1,626 lines, functioning as a shim delegating to `cmd/ate-setup`.
   - `cmd/ate-setup` compiles as a Go CLI with typed testing for overlays, kind/GKE clusters, Cloud SQL, and multi-architecture Dockerfile image building.
 
-### 7. Release v0.2.0 & PodCertificateRequest v1
+### 8. Release v0.2.0 & PodCertificateRequest v1
 * **Commits:** `10a1bfb2` (PR #1829), `8b5d9ff0` (PR #1874)
 * **Details:**
   - Dual `v1beta1` and `v1` PodCertificateRequest (PCR) support was added in `cmd/podcertcontroller/internal/podcertificate/client.go:140-230`, favoring Kubernetes 1.37 `v1`.
@@ -154,62 +162,49 @@ graph TD
 
 ---
 
-## 5. Where the Churn Is
+## 5. Critical Interface Changes and Developer Gotchas
 
-The following table reflects the relative churn across the codebase over this two-week window (677 non-vendor files modified, 57,629 insertions, 21,694 deletions):
+1. **BREAKING: `EgressPolicy` API Structure (`6621f2b4`):**
+   `hostnames`, `cidrs`, and `all` rules are gone from `pkg/proto/ateapipb/ateapi.proto`. Rules are now divided by protocol: `http` (cleartext), `https` (MITMed TLS), and `tls_passthrough` (raw SNI TLS). `inject_static_headers` is renamed to `replace_headers`. Existing pre-GA egress policies must be recreated.
 
-| Subsystem / Directory | File Churn (%) | Commits | Key Movement & Architectural Focus |
-| :--- | :--- | :--- | :--- |
-| **`cmd/ateapi/`** | ~14.0% | 34 | `controlapi/` added `RevertActor`, snapshot tags, crash reason recording; `store/atepg/` split `atepg.go` into per-resource files; embedded OpenFGA with Goose migrations; moved `apiauthn` into internal server package. |
-| **`cmd/ate-setup/`** | ~7.0% | 12 | Completely ported install and demo scripts into Go (`steps/`, `kube/`, `demos/`, `config/`), added multi-arch arm64 support, and large-cluster sizing options. |
-| **`cmd/kubectl-ate/`** | ~6.2% | 8 | Consolidated scattered verb-resource files into unified per-resource CLI definitions (`actor.go`, `actortemplate.go`, `worker.go`); added `revert actor` and `egress-policy` subcommands; switched single outputs to bare objects. |
-| **`internal/e2e/`** | ~5.5% | 19 | Added new `multiactor` test suites, updated volume tests (`combinedvolumes`), added assertions for OTLP lifecycle log events and egress credential injection. |
-| **`cmd/atenet/`** | ~4.8% | 15 | Implemented multi-leg `EgressPolicy` enforcement in `router/egress/` and `extproc/`; increased default route timeout from 10s to 5m; handled `unknown` resume metrics. |
-| **`benchmarking/`** | ~4.5% | 11 | Added SWE-bench / SWE-perf trajectory workload (`boomer/sweperf/`); cluster hardware and density frontier discovery (`cluster_facts.py`); eliminated checked-in Python protobufs. |
-| **`cmd/atelet/`** | ~4.1% | 10 | Refactored `RestoreRequest` to use typed `base_config` snapshot sources; integrated `ActorDirs`; added actor cleanup on termination; supported resolved sandbox assets. |
-| **`cmd/ateom-microvm/` & `cmd/ateom-gvisor/`** | ~4.3% | 14 | Multi-actor support; Kata Assets bumped to 4.1.0 with virtiofsd 1.14.0; dropped `kata-config`; fixed runsc zombie container teardown races; per-actor cgroup trees. |
-| **`internal/atunnel/`, `internal/ateomnet/`, `internal/ateomcgroup/`** | ~3.1% | 12 | Per-sandbox network namespaces, veth plumbing, local DNS relays, UDP non-DNS drop filters, and UID-keyed cgroups. |
-| **`hack/`** | ~2.6% | 14 | Removed ~1,600 lines from `install-ate.sh`; deleted all `install-demo-*.sh` scripts; integrated `gotestsum` for JUnit output and test timeouts. |
-| **`internal/actorevent/`, `internal/otlprelay/`, `internal/serverboot/`** | ~1.5% | 7 | OTLP log event pipeline for actor state changes (`ate.actor.state_changed`, `ate.actor.crashed`), usage sampling events (`ate.actor.usage_sampled`), and relay logging. |
-| **`cmd/dataplane/envoy/` & `cmd/credential-provider/`** | ~1.5% | 5 | Envoy Dynamic Modules (Rust crate for egress policy); Kubernetes Secrets credential provider service with `statusz` health probes. |
+2. **Node Path Relocation to `/var/lib/ate` (`c7dbe9d6`):**
+   `nodepath.BasePath` is `/var/lib/ate`, not `/var/lib/ateom-gvisor`. Host mount configurations and CSI daemonsets must mount `/var/lib/ate`.
 
----
-
-## 6. Critical Interface Changes and Developer Gotchas
-
-1. **Incompatible `RestoreRequest` Wire Format (`1d7ca8ce`):**
+3. **Incompatible `RestoreRequest` Wire Format (`1d7ca8ce`):**
    `golden_snapshot_uri` was removed from `RestoreRequest` in `internal/proto/ateletpb/atelet.proto:452-479`. It is replaced by `ExternalRestoreConfiguration base_config = 12` and required field `SandboxAssets sandbox_assets = 16`. `ateapi` and `atelet` must be rolled and updated together.
 
-2. **`kubectl-ate` Single-Resource Output Formatting (`32e08c22`):**
+4. **`kubectl-ate` Single-Resource Output Formatting (`32e08c22`):**
    `kubectl ate get <resource> <name> -o json|yaml` now emits a single un-wrapped object rather than a `{ "items": [ ... ] }` list (`cmd/kubectl-ate/internal/printer/printer.go:81-120`). Automated scripts parsing `.items[0]` will fail.
 
-3. **Complete Removal of `internal/ateerrors` (`74bbfc52`):**
+5. **Complete Removal of `internal/ateerrors` (`74bbfc52`):**
    The `ateerrors` package and its failure-reason taxonomy were deleted. Actor crash details are now stored directly in `Actor.status.crash_reason` and `Actor.status.crashed_at` (`pkg/proto/ateapipb/ateapi.proto:1191-1215`).
 
-4. **Schema and Field Renames:**
+6. **Schema and Field Renames:**
    * `SnapshotsConfig` renamed to `SnapshotConfig` across all protos and templates (`fb4b3152`).
    * `readyz` probe in `ActorTemplate` renamed to `wakeupProbe` (`d277088b`).
    * `LocalSnapshotInfo` renamed to `LocalSnapshot` (`d72edfbb`).
    * `golden_snapshot` field in `ActorTemplateSpec` renamed to `golden_tag` (`a58481a1`).
 
-5. **Path Package Relocations:**
+7. **Path Package Relocations:**
+   * `internal/ateomnet` was decomposed into `internal/ateomnet/netns` and `internal/ateomnet/dns` (`22efea18`).
    * `cmd/atelet` no longer imports `internal/ateompath`. Per-actor paths now reside in `cmd/atelet/internal/ateletpath`, while shared mounts and sockets are defined in `internal/nodepath` (`a0b680d7`).
    * Authentication configs moved from `internal/ateapiauth` to `cmd/ateapi/internal/apiauthn` (`c7b54699`).
 
-6. **Worker Sandbox Class Immutability (`44f4000c`):**
+8. **Worker Sandbox Class Immutability (`44f4000c`):**
    `UpdateWorker` rejects modifications to `sandbox_class`. Changing the isolation runtime requires creating a new worker pool.
 
-7. **Dropped UDP Egress (`58624ee8`):**
+9. **Dropped UDP Egress (`58624ee8`):**
    Actor egress for UDP traffic on ports other than 53 is now dropped at the worker veth interface. Applications attempting to establish direct QUIC/HTTP-3 connections externally must fall back to HTTP/1.1 or HTTP/2 over TCP.
 
 ---
 
-## 7. Unresolved Follow-Ups and Open Work
+## 6. Unresolved Follow-Ups and Open Work
 
-While remote GitHub issues could not be retrieved over the network due to unauthenticated CLI credentials, explicit follow-up commitments and architectural gaps documented across the commits include:
+Explicit follow-up commitments and architectural gaps documented across the commits include:
 
 | Area / Component | Unresolved Task | Background & Tracking |
 | :--- | :--- | :--- |
+| **Egress Policy GA** | **Full Implementation of Redesigned Protocols**: PR #1751 introduced proto changes and validation/e2e compile fixes. Full implementation across router dynamic forward proxy, named CONNECT preservation, and TCP non-HTTP support are fast-follows. | Issue #823, PR #1751 (`6621f2b4`) |
 | **Worker / `ateom` Paths** | **Switch `ateom` to read `ActorDirs` over RPC**: `atelet` now transmits `ActorDirs` during workload execution RPCs, but `ateom-gvisor` and `ateom-microvm` still derive paths via `internal/ateompath`. Follow-up PRs are needed to consume `ActorDirs` and delete `internal/ateompath`. | Issue #1604, PR #1730 (`a0b680d7`) |
 | **Observability / OTLP** | **Step 4 of Actor Usage Events**: Event schemas and scopes (`ate.actor.usage_sampled`) were registered (`03ba5821`), and relay logging was enabled (`93e691d9`). Step 4 must move the emission anchor into the `ateom` runtime, update poller comments, and instruct `atecontroller` to pass `OTEL_LOGS_EXPORTER` to worker pods. | Issue #1748, PR #1881 (`03ba5821`) |
 | **Autoscaling / HPA** | **Capacity-Aware HPA for Multi-Actor Pools**: Multi-actor worker support (`14c0c136`) invalidates the previous 1:1 worker autoscaling assumptions. HPA logic needs redesigning to scale based on slot occupancy and memory frontiers. | Issue #1266, PR #1836 (`14c0c136`) |
